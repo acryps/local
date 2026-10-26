@@ -1,0 +1,25 @@
+{
+	"name": "@acryps/local",
+	"version": "0.0.1",
+	"description": "Geo-Distributed PostgreSQL Data Management",
+	"license": "GPL-3.0-only",
+	"keywords": [
+		"data management",
+		"postgres",
+		"postgresql",
+		"geo-distributed"
+	],
+	"type": "commonjs",
+	"main": ".built/index.js",
+	"typings": ".built/index.d.ts",
+	"sideEffects": false,
+	"scripts": {
+		"build": "tsc"
+	},
+	"devDependencies": {
+		"typescript": "^6.0.3"
+	},
+	"dependencies": {
+		"vlquery": "^8.2.1"
+	}
+}
