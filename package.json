@@ -16,10 +16,11 @@
 	"scripts": {
 		"build": "tsc"
 	},
-	"devDependencies": {
-		"typescript": "^6.0.3"
+	"peerDependencies": {
+		"vlquery": "^9.0.0"
 	},
-	"dependencies": {
-		"vlquery": "^8.2.1"
+	"devDependencies": {
+		"typescript": "^6.0.3",
+		"vlquery": "^9.0.0"
 	}
 }
