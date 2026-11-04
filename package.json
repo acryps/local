@@ -12,15 +12,24 @@
 	"type": "commonjs",
 	"main": ".built/index.js",
 	"typings": ".built/index.d.ts",
+	"exports": {
+		".": {
+			"types": "./.built/index.d.ts",
+			"default": "./.built/index.js"
+		}
+	},
+	"bin": {
+		"acryps-local": ".built/cli.js"
+	},
 	"sideEffects": false,
 	"scripts": {
 		"build": "tsc"
 	},
-	"peerDependencies": {
+	"dependencies": {
 		"vlquery": "^9.0.0"
 	},
 	"devDependencies": {
-		"typescript": "^6.0.3",
-		"vlquery": "^9.0.0"
+		"@types/node": "^26.6.6",
+		"typescript": "^6.0.3"
 	}
 }

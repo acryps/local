@@ -3,8 +3,12 @@
 		"module": "commonjs",
 		"target": "esnext",
 		"declaration": true,
+		"skipLibCheck": true,
 		"outDir": ".built",
-		"rootDir": "source"
+		"rootDir": "source",
+		"types": [
+			"node"
+		]
 	},
 	"include": [
 		"source/**/*.ts"
