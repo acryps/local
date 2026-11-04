@@ -81,10 +81,14 @@ export abstract class Database<TContext extends DatabaseContext> {
 		this.tag = connection.tag;
 
 		this.client = new DbClient({
+			...connection.options,
+
 			host: connection.host,
 			database: connection.database,
 			user: connection.user,
-			password: connection.password
+			password: connection.password,
+			min: connection.min,
+			max: connection.max
 		});
 
 		this.context = new contextConstructor(this.client, runContext);
