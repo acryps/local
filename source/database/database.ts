@@ -285,22 +285,17 @@ export class Database<TContext extends DatabaseContext> {
 	}
 
 	/**
-	 * Query of all entities referencing the item
+	 * Query of all entities referencing the item, in the database the pointer of the cohort of the item targets
 	 *
-	 * entities referencing a pointer are queried in the targeted database, entities referencing other entities in the local database
+	 * @param reference primary reference of the item (`chat.messages`)
+	 * @param pointerId id of the top level entity of the cohort (`related(message.pictures, chatId)`), defaults to the id of the item for top level entities (`related(chat.messages)`)
 	 */
-	related<TModel extends ExposedModel<TContext> & Entity<TQueryProxy>, TQueryProxy extends QueryProxy>(reference: PrimaryReference<TModel, TQueryProxy>): Queryable<TModel, TQueryProxy> {
+	related<TModel extends ExposedModel<TContext> & Entity<TQueryProxy>, TQueryProxy extends QueryProxy>(reference: PrimaryReference<TModel, TQueryProxy>, pointerId?: string | number): Queryable<TModel, TQueryProxy> {
 		this.requireExposed(reference.$relation);
 
 		const item = reference.$$item;
 
-		if (this.pointedSetNames.has(item.constructor)) {
-			const pointerSetName = this.setNames.get(item.constructor)!;
-
-			return new RoutedQuery<TModel, TQueryProxy>(() => this.requirePointerInstance(pointerSetName, item.id), context => context.related(reference), this.queryHooks(reference.$relation));
-		}
-
-		return new RoutedQuery<TModel, TQueryProxy>(async () => this.local, context => context.related(reference), this.queryHooks(reference.$relation));
+		return new RoutedQuery<TModel, TQueryProxy>(() => this.requireCohortInstance(item.constructor, pointerId ?? item.id), context => context.related(reference), this.queryHooks(reference.$relation));
 	}
 
 	private queryHooks(type: Function): RoutedQueryHooks<any> {
@@ -516,16 +511,6 @@ export class Database<TContext extends DatabaseContext> {
 		const pointer: { target: string } = await this.local.use(context => this.set(context, pointerSetName).find(pointerId));
 
 		return pointer ? this.instance(pointer.target) : null;
-	}
-
-	private async requirePointerInstance(pointerSetName: string, pointerId: string | number) {
-		const instance = await this.pointerInstance(pointerSetName, pointerId);
-
-		if (!instance) {
-			throw new Error(`No pointer '${pointerId}' found in '${pointerSetName}' of database '${this.tag}'`);
-		}
-
-		return instance;
 	}
 
 	/**
