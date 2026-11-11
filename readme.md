@@ -32,7 +32,8 @@ Pointers are looked up in the local database.
 - `related(reference, pointerId?)`: from the database the pointer of the cohort of the item targets, `pointerId` defaults to the id of the item for top level tables
 - `fetch`, `backload`: a foreign key to a pointer table loads from the database the pointer targets, other foreign keys load from the local database
 - included pointers (`include`, `includeTree`, `backload`) are replaced by the entity they point to, loaded from the database the pointer targets. in `includeTree` the subtree of a pointer reference describes that entity (`{ fromAccount: { id: true, username: true } }`)
-- `create`: in the local database, a top level entity gets a pointer to the local database first and shares its id
+- `create(item)`: top level entities in the local database, they get a pointer to the local database first and share its id. top level entities can not be created in other databases
+- `create(pointerId, item)`: cohort members in the database the pointer targets (`create(chatId, message)`). pointers referenced by the item are not copied, so the insert fails if the target database does not know them
 - `update(pointerId, item)`: in the database the pointer targets
 - `delete(pointerId, item)`: in the database the pointer targets, a top level entity takes its pointer in that database along. pointers in other databases are left as they are
 - views: local database only

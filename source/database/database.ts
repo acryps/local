@@ -202,22 +202,48 @@ export class Database<TContext extends DatabaseContext> {
 	}
 
 	/**
-	 * Creates the item in the local database
+	 * Creates a top level item, or an item which is not part of a cohort, in the local database
 	 *
 	 * a top level item gets a pointer to the local database first, the item is created with the id of the pointer
 	 */
-	async create<TModel extends ExposedModel<TContext>>(item: TModel, comment?: string): Promise<TModel> {
+	async create<TModel extends ExposedModel<TContext>>(item: TModel, comment?: string): Promise<TModel>;
+
+	/**
+	 * Creates the item in the database the pointer of its cohort targets
+	 *
+	 * @param pointerId id of the top level entity of the cohort (`create(chatId, message)`)
+	 */
+	async create<TModel extends ExposedModel<TContext>>(pointerId: string | number, item: TModel, comment?: string): Promise<TModel>;
+
+	async create<TModel extends ExposedModel<TContext>>(...args: [TModel, string?] | [string | number, TModel, string?]): Promise<TModel> {
+		const [pointerId, item, comment] = args[0] instanceof Entity ? [undefined, args[0], args[1] as string | undefined] : args as [string | number, TModel, string?];
+
 		this.requireExposed(item.constructor);
 
 		const pointerSetName = this.pointerSetNames.get(item.constructor);
 
 		if (pointerSetName) {
+			// top level items are always created in the local database
+			if (pointerId !== undefined) {
+				throw new Error(`'${item.constructor.name}' is a top level entity and can only be created in database '${this.tag}'`);
+			}
+
 			return this.local.use(async context => {
 				const pointer = this.createPointer(pointerSetName);
 				await context.create(pointer);
 
 				return createWithId(context, item, pointer.id, comment);
 			});
+		}
+
+		if (this.cohortPointerSetNames.get(item.constructor)?.length) {
+			if (pointerId === undefined) {
+				throw new Error(`'${item.constructor.name}' is part of a cohort, the pointer id is required to create it`);
+			}
+
+			const instance = await this.requireCohortInstance(item.constructor, pointerId);
+
+			return instance.use(context => context.create(item, comment));
 		}
 
 		return this.local.use(context => context.create(item, comment));
