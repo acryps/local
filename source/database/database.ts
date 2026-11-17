@@ -1,12 +1,8 @@
 import { DatabaseContext, DbClient, DbSet, Entity, ForeignReference, PrimaryReference, QueryProxy, Queryable, ViewSet } from 'vlquery';
 import { DatabaseConfiguration } from '../types/database-configuration';
+import { isPointer, parseCohorts, pointerSuffix } from './cohorts';
 import { DatabaseInstance } from './instance';
 import { RoutedQuery, RoutedQueryHooks } from './routed-query';
-
-/**
- * Suffix of entity classes that are kept internal
- */
-const pointerSuffix = '_Pointer';
 
 /**
  * Milliseconds a remote connection stays open after its last use
@@ -113,22 +109,22 @@ export class Database<TContext extends DatabaseContext> {
 	 */
 	private readonly schema: TContext;
 
-	private readonly setNames = new Map<Function, string>();
+	private readonly setNames: Map<Function, string>;
 
 	/**
 	 * Top level type to the name of its pointer set
 	 */
-	private readonly pointerSetNames = new Map<Function, string>();
+	private readonly pointerSetNames: Map<Function, string>;
 
 	/**
 	 * Pointer type to the name of the set it points to
 	 */
-	private readonly pointedSetNames = new Map<Function, string>();
+	private readonly pointedSetNames: Map<Function, string>;
 
 	/**
 	 * Type to the names of the pointer sets of the cohorts it belongs to
 	 */
-	private readonly cohortPointerSetNames = new Map<Function, string[]>();
+	private readonly cohortPointerSetNames: Map<Function, string[]>;
 
 	constructor(configuration: DatabaseConfiguration<TContext>) {
 		this.tag = configuration.local.tag;
@@ -144,32 +140,18 @@ export class Database<TContext extends DatabaseContext> {
 
 		this.schema = new configuration.context(new DbClient(), configuration.runContext);
 
-		for (let name in this.schema) {
-			const set = this.schema[name];
-
-			if (set instanceof DbSet) {
-				this.setNames.set(set.modelConstructor, name);
-			}
-		}
-
-		for (let [type, name] of this.setNames) {
-			if (name.endsWith(pointerSuffix)) {
-				const pointedName = name.substring(0, name.length - pointerSuffix.length);
-				const pointedSet = this.schema[pointedName as keyof TContext];
-
-				if (pointedSet instanceof DbSet) {
-					this.pointerSetNames.set(pointedSet.modelConstructor, name);
-					this.pointedSetNames.set(type, pointedName);
-				}
-			}
-		}
+		// throws if the structure can not be parsed into cohorts
+		({
+			setNames: this.setNames,
+			pointerSetNames: this.pointerSetNames,
+			pointedSetNames: this.pointedSetNames,
+			cohortPointerSetNames: this.cohortPointerSetNames
+		} = parseCohorts(this.schema));
 
 		const sets: Record<string, object> = {};
 
 		for (let [type, name] of this.setNames) {
 			if (!this.isPointer(type)) {
-				this.cohortPointerSetNames.set(type, this.findCohortPointerSetNames(type, new Set()));
-
 				// queries only read the local database
 				sets[name] = this.exposeSet(
 					(pointerId: string | number, id = pointerId) => this.find(type, pointerId, id),
@@ -659,39 +641,6 @@ export class Database<TContext extends DatabaseContext> {
 	}
 
 	/**
-	 * Pointer sets of the top level types the type references, directly or through other entities
-	 */
-	private findCohortPointerSetNames(type: Function, visited: Set<Function>): string[] {
-		const pointerSetName = this.pointerSetNames.get(type);
-
-		if (pointerSetName) {
-			return [pointerSetName];
-		}
-
-		if (visited.has(type)) {
-			return [];
-		}
-
-		visited.add(type);
-
-		const names = new Set<string>();
-		const model = new (type as new () => Entity<QueryProxy>)();
-
-		for (let key in model) {
-			const reference = model[key as keyof typeof model];
-
-			// a reference to a pointer leads into another cohort
-			if (reference instanceof ForeignReference && reference.$relation && !this.isPointer(reference.$relation)) {
-				for (let name of this.findCohortPointerSetNames(reference.$relation, visited)) {
-					names.add(name);
-				}
-			}
-		}
-
-		return [...names];
-	}
-
-	/**
 	 * Tables of the cohort of the top level type, every table after the tables referencing it (children first)
 	 *
 	 * the children of a table are the tables referencing it, except for pointers and top level tables
@@ -887,7 +836,7 @@ export class Database<TContext extends DatabaseContext> {
 	}
 
 	private isPointer(type: Function) {
-		return type.name.endsWith(pointerSuffix);
+		return isPointer(type);
 	}
 
 	private requireExposed(type: Function | undefined) {

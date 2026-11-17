@@ -31,6 +31,12 @@ A move only updates the pointers of the databases it involves, so other database
 When such a stale pointer is used, it is updated to target the database the cohort is stored in (`EU → AP`).
 When the path ends in a database without the pointer, the cohort has been deleted and the used pointer is deleted as well, unless rows still reference it.
 
+### Validation
+`acryps-local create-context` parses the database structure into cohorts and stops the build with an error listing every problem found, `new Database(...)` throws a `CohortStructureError` for the same problems:
+- a pointer table points to an existing table, has a `target` column, shares the id type of the table it points to and references no other tables
+- a table belongs to one cohort at most, as its rows are stored in one database
+- a top level table references the tables of other cohorts through their pointer tables
+
 ## Operations
 - queries (`where`, `first`, `toArray`, ...): local database only
 - `find(pointerId, id?)`: from the database the pointer targets, `id` defaults to `pointerId` for top level tables
