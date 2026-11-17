@@ -43,7 +43,7 @@ When the path ends in a database without the pointer, the cohort has been delete
 - `related(reference, pointerId?)`: from the database the pointer of the cohort of the item targets, `pointerId` defaults to the id of the item for top level tables
 - `fetch`, `backload`: a foreign key to a pointer table loads from the database the pointer targets, other foreign keys load from the local database
 - included pointers (`include`, `includeTree`, `backload`) are replaced by the entity they point to, loaded from the database the pointer targets. in `includeTree` the subtree of a pointer reference describes that entity (`{ fromAccount: { id: true, username: true } }`)
-- `create(item)`: top level entities in the local database, they get a pointer to the local database first and share its id. top level entities can not be created in other databases
+- `create(item)`: top level entities in the local database, they get a pointer to the local database first and share its id. top level entities can not be created in other databases. the databases storing the cohorts the entity references through their pointers get a pointer to it as well, targeting the local database (a chat between an `eu` and a `us` account created in `eu` gets a pointer in `us`)
 - `create(pointerId, item)`: cohort members in the database the pointer targets (`create(chatId, message)`). pointers referenced by the item are not copied, so the insert fails if the target database does not know them
 - `update(pointerId, item)`: in the database the pointer targets
 - `delete(pointerId, item)`: in the database the pointer targets, a top level entity takes its pointer in that database along. pointers in other databases are deleted once they are used

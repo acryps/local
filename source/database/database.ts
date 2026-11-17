@@ -192,6 +192,7 @@ export class Database<TContext extends DatabaseContext> {
 	 * Creates a top level item, or an item which is not part of a cohort, in the local database
 	 *
 	 * a top level item gets a pointer to the local database first, the item is created with the id of the pointer
+	 * the databases storing the cohorts the top level item references through their pointers get a pointer to it as well
 	 */
 	async create<TModel extends ExposedModel<TContext>>(item: TModel, comment?: string): Promise<TModel>;
 
@@ -215,12 +216,16 @@ export class Database<TContext extends DatabaseContext> {
 				throw new Error(`'${item.constructor.name}' is a top level entity and can only be created in database '${this.tag}'`);
 			}
 
-			return this.local.use(async context => {
+			const created = await this.local.use(async context => {
 				const pointer = this.createPointer(pointerSetName);
 				await context.create(pointer);
 
 				return createWithId(context, item, pointer.id, comment);
 			});
+
+			await this.createReferencingPointers(created, pointerSetName);
+
+			return created;
 		}
 
 		if (this.cohortPointerSetNames.get(item.constructor)?.length) {
@@ -773,6 +778,30 @@ export class Database<TContext extends DatabaseContext> {
 		} else {
 			await context.$$query(`UPDATE ${identifier(meta.source)} SET ${column} = $2 WHERE id = $1`, [pointerId, target]);
 		}
+	}
+
+	/**
+	 * Creates the pointer of the top level item, targeting the local database, in the databases storing the cohorts the item references through their pointers
+	 *
+	 * a chat between an eu and a us account is created in eu, the us database gets a pointer to it as well
+	 */
+	private async createReferencingPointers(item: Entity<QueryProxy>, pointerSetName: string) {
+		const instances = new Set<DatabaseInstance<TContext>>();
+
+		for (let key in item) {
+			const reference = item[key as keyof typeof item];
+
+			if (reference instanceof ForeignReference && reference.$relation && this.isPointer(reference.$relation) && reference.id !== null && reference.id !== undefined) {
+				const instance = await this.pointerInstance(this.setNames.get(reference.$relation)!, reference.id);
+
+				// a deleted cohort has no database to inform
+				if (instance && instance != this.local) {
+					instances.add(instance);
+				}
+			}
+		}
+
+		await Promise.all([...instances].map(instance => instance.use(context => this.setPointer(context, pointerSetName, item.id, this.tag, true))));
 	}
 
 	/**
