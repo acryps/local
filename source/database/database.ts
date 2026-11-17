@@ -126,6 +126,11 @@ export class Database<TContext extends DatabaseContext> {
 	 */
 	private readonly cohortPointerSetNames: Map<Function, string[]>;
 
+	/**
+	 * Database each loaded or written entity is stored in, entities do not remember it themselves
+	 */
+	private readonly origins = new WeakMap<object, DatabaseInstance<TContext>>();
+
 	constructor(configuration: DatabaseConfiguration<TContext>) {
 		this.tag = configuration.local.tag;
 		this.local = new DatabaseInstance(configuration.local, configuration.context, configuration.runContext);
@@ -204,7 +209,7 @@ export class Database<TContext extends DatabaseContext> {
 	async create<TModel extends ExposedModel<TContext>>(pointerId: string | number, item: TModel, comment?: string): Promise<TModel>;
 
 	async create<TModel extends ExposedModel<TContext>>(...args: [TModel, string?] | [string | number, TModel, string?]): Promise<TModel> {
-		const [pointerId, item, comment] = args[0] instanceof Entity ? [undefined, args[0], args[1] as string | undefined] : args as [string | number, TModel, string?];
+		const [pointerId, item, comment] = splitItemArguments(args);
 
 		this.requireExposed(item.constructor);
 
@@ -216,12 +221,8 @@ export class Database<TContext extends DatabaseContext> {
 				throw new Error(`'${item.constructor.name}' is a top level entity and can only be created in database '${this.tag}'`);
 			}
 
-			const created = await this.local.use(async context => {
-				const pointer = this.createPointer(pointerSetName);
-				await context.create(pointer);
-
-				return createWithId(context, item, pointer.id, comment);
-			});
+			const created = await this.local.use(async context => createWithId(context, item, await this.insertPointer(context, pointerSetName), comment));
+			this.origins.set(created, this.local);
 
 			await this.createReferencingPointers(created, pointerSetName);
 
@@ -235,42 +236,65 @@ export class Database<TContext extends DatabaseContext> {
 
 			const instance = await this.requireCohortInstance(item.constructor, pointerId);
 
-			return instance.use(context => context.create(item, comment));
+			return this.remember(await instance.use(context => context.create(item, comment)), instance);
 		}
 
-		return this.local.use(context => context.create(item, comment));
+		return this.remember(await this.local.use(context => context.create(item, comment)), this.local);
 	}
 
 	/**
-	 * Updates the item in the database the pointer of its cohort targets
+	 * Updates the item in the database it has been loaded from
+	 *
+	 * a top level item, or an item which is not part of a cohort, does not have to be loaded through this database
 	 */
-	async update<TModel extends ExposedModel<TContext>>(pointerId: string | number, item: TModel, comment?: string): Promise<TModel> {
+	async update<TModel extends ExposedModel<TContext>>(item: TModel, comment?: string): Promise<TModel>;
+
+	/**
+	 * Updates the item in the database the pointer of its cohort targets
+	 *
+	 * @param pointerId id of the top level entity of the cohort (`update(chatId, message)`)
+	 */
+	async update<TModel extends ExposedModel<TContext>>(pointerId: string | number, item: TModel, comment?: string): Promise<TModel>;
+
+	async update<TModel extends ExposedModel<TContext>>(...args: [TModel, string?] | [string | number, TModel, string?]): Promise<TModel> {
+		const [pointerId, item, comment] = splitItemArguments(args);
+
 		this.requireExposed(item.constructor);
 
-		const instance = await this.requireCohortInstance(item.constructor, pointerId);
+		const instance = await this.itemInstance(item, pointerId);
 
-		return instance.use(context => context.update(item, comment));
+		return this.remember(await instance.use(context => context.update(item, comment)), instance);
 	}
+
+	/**
+	 * Deletes the item from the database it has been loaded from
+	 *
+	 * a top level item, or an item which is not part of a cohort, does not have to be loaded through this database
+	 * a top level item takes its pointer in that database along, unless rows of other cohorts still reference it, pointers in other databases are left as they are
+	 * a deactivated item keeps its pointer, as its rows are still stored
+	 */
+	async delete<TModel extends ExposedModel<TContext>>(item: TModel, comment?: string): Promise<void>;
 
 	/**
 	 * Deletes the item from the database the pointer of its cohort targets
 	 *
-	 * a top level item takes its pointer in that database along, pointers in other databases are left as they are
+	 * @param pointerId id of the top level entity of the cohort (`delete(chatId, message)`)
 	 */
-	async delete<TModel extends ExposedModel<TContext>>(pointerId: string | number, item: TModel, comment?: string): Promise<void> {
+	async delete<TModel extends ExposedModel<TContext>>(pointerId: string | number, item: TModel, comment?: string): Promise<void>;
+
+	async delete<TModel extends ExposedModel<TContext>>(...args: [TModel, string?] | [string | number, TModel, string?]): Promise<void> {
+		const [pointerId, item, comment] = splitItemArguments(args);
+
 		this.requireExposed(item.constructor);
 
-		const instance = await this.requireCohortInstance(item.constructor, pointerId);
+		const instance = await this.itemInstance(item, pointerId);
 		const pointerSetName = this.pointerSetNames.get(item.constructor);
 
 		await instance.use(async context => {
 			await context.delete(item, comment);
 
-			if (pointerSetName) {
-				const pointer = this.createPointer(pointerSetName);
-				pointer.id = item.id;
-
-				await context.delete(pointer);
+			if (pointerSetName && !item.$$meta.active) {
+				await this.deletePointer(context, pointerSetName, item.id);
 			}
 		});
 	}
@@ -350,12 +374,14 @@ export class Database<TContext extends DatabaseContext> {
 	/**
 	 * Loads the referenced entity
 	 *
-	 * a reference to a pointer loads the entity it points to from the targeted database, other references load from the local database
+	 * a reference to a pointer loads the entity it points to from the targeted database
+	 * a reference within a cohort loads from the database the referencing item has been loaded from, other references load from the local database
 	 */
 	async fetch<TModel extends Entity<QueryProxy>>(reference: Partial<ForeignReference<TModel>>): Promise<PointedModel<TContext, TModel>> {
+		const stored = (reference as unknown as { $stored: unknown }).$stored;
+
 		if (reference.$relation && this.pointedSetNames.has(reference.$relation)) {
 			const pointedType = this.set(this.schema, this.pointedSetNames.get(reference.$relation)!).modelConstructor;
-			const stored = (reference as unknown as { $stored: unknown }).$stored;
 
 			// included pointers have already been replaced by the entity they point to
 			if (reference.hasPrefetched && stored instanceof pointedType) {
@@ -365,21 +391,29 @@ export class Database<TContext extends DatabaseContext> {
 			return this.fetchPointed(reference as ForeignReference<TModel>);
 		}
 
-		return this.local.use(context => context.fetch(reference)) as Promise<PointedModel<TContext, TModel>>;
+		if (reference.hasPrefetched) {
+			return stored as PointedModel<TContext, TModel>;
+		}
+
+		if (reference.id === null || reference.id === undefined) {
+			return null as PointedModel<TContext, TModel>;
+		}
+
+		const instance = await this.referenceInstance(reference as ForeignReference<TModel>);
+
+		return this.remember(await instance.use(context => context.fetch(reference)), instance) as PointedModel<TContext, TModel>;
 	}
 
 	/**
-	 * Query of all entities referencing the item, in the database the pointer of the cohort of the item targets
+	 * Query of all entities referencing the item, in the database the item has been loaded from
 	 *
 	 * @param reference primary reference of the item (`chat.messages`)
-	 * @param pointerId id of the top level entity of the cohort (`related(message.pictures, chatId)`), defaults to the id of the item for top level entities (`related(chat.messages)`)
+	 * @param pointerId id of the top level entity of the cohort (`related(message.pictures, chatId)`), only required for items not loaded through this database which are not top level entities
 	 */
 	related<TModel extends ExposedModel<TContext> & Entity<TQueryProxy>, TQueryProxy extends QueryProxy>(reference: PrimaryReference<TModel, TQueryProxy>, pointerId?: string | number): Queryable<TModel, TQueryProxy> {
 		this.requireExposed(reference.$relation);
 
-		const item = reference.$$item;
-
-		return new RoutedQuery<TModel, TQueryProxy>(() => this.requireCohortInstance(item.constructor, pointerId ?? item.id), context => context.related(reference), this.queryHooks(reference.$relation));
+		return new RoutedQuery<TModel, TQueryProxy>(() => this.itemInstance(reference.$$item, pointerId), context => context.related(reference), this.queryHooks(reference.$relation));
 	}
 
 	private queryHooks(type: Function): RoutedQueryHooks<any> {
@@ -393,9 +427,14 @@ export class Database<TContext extends DatabaseContext> {
 	 * Loads missing referenced data defined in the tree
 	 *
 	 * references to pointers load the entity they point to from the targeted database, the subtree applies to that entity
+	 * other references load from the database the item has been loaded from
+	 *
+	 * @param pointerId id of the top level entity of the cohort, only required for items not loaded through this database which are not top level entities
 	 */
-	async backload(item: ExposedModel<TContext>, tree: any): Promise<void> {
+	async backload(item: ExposedModel<TContext>, tree: any, pointerId?: string | number): Promise<void> {
 		this.requireExposed(item.constructor);
+
+		const instance = await this.itemInstance(item, pointerId);
 
 		const localTree: Record<string, any> = {};
 		const tasks: Promise<void>[] = [];
@@ -425,10 +464,10 @@ export class Database<TContext extends DatabaseContext> {
 			}
 		}
 
-		tasks.push(this.local.use(context => context.backload(item, localTree)));
+		tasks.push(instance.use(context => context.backload(item, localTree)));
 
 		await Promise.all(tasks);
-		await this.resolveIncludedPointers([item], tree, this.local);
+		await this.resolveIncludedPointers([item], tree, instance);
 	}
 
 	/**
@@ -459,6 +498,7 @@ export class Database<TContext extends DatabaseContext> {
 	 * Replaces included pointers with the entities they point to, loaded from the databases the pointers target
 	 *
 	 * the subtree of a pointer reference in the tree is included in the entity replacing it
+	 * every entity reached is remembered with the database it has been loaded from
 	 *
 	 * @param instance database the items have been loaded from, the included pointers are followed from there
 	 */
@@ -472,6 +512,10 @@ export class Database<TContext extends DatabaseContext> {
 			}
 
 			visited.add(item);
+
+			// entities loaded before, like the ones backload replaced pointers with, keep their database
+			origin = this.origins.get(item) ?? origin;
+			this.origins.set(item, origin);
 
 			const tasks: Promise<void>[] = [];
 
@@ -525,7 +569,71 @@ export class Database<TContext extends DatabaseContext> {
 			return null;
 		}
 
-		return instance.use(context => this.set(context, this.setNames.get(type)!).find(id));
+		return this.remember(await instance.use(context => this.set(context, this.setNames.get(type)!).find(id)), instance);
+	}
+
+	/**
+	 * Remembers the database the entity is stored in
+	 */
+	private remember<TItem>(item: TItem, instance: DatabaseInstance<TContext>) {
+		if (item instanceof Entity) {
+			this.origins.set(item, instance);
+		}
+
+		return item;
+	}
+
+	/**
+	 * Database the item is stored in
+	 *
+	 * the local database if the item is not part of a cohort, otherwise the database the pointer targets, the item has been loaded from or the pointer of a top level item targets
+	 *
+	 * @param pointerId id of the top level entity of the cohort, overrides the database the item has been loaded from
+	 */
+	private async itemInstance(item: Entity<QueryProxy>, pointerId?: string | number) {
+		const type = item.constructor;
+
+		if (!this.cohortPointerSetNames.get(type)?.length) {
+			return this.local;
+		}
+
+		if (pointerId !== undefined) {
+			return this.requireCohortInstance(type, pointerId);
+		}
+
+		const origin = this.origins.get(item);
+
+		if (origin) {
+			return origin;
+		}
+
+		if (this.pointerSetNames.has(type)) {
+			return this.requireCohortInstance(type, item.id);
+		}
+
+		throw new Error(`'${type.name}' '${item.id}' has not been loaded through database '${this.tag}', the pointer id of its cohort is required`);
+	}
+
+	/**
+	 * Database the referenced entity is stored in, references within a cohort lead into the database of the referencing item
+	 */
+	private async referenceInstance(reference: ForeignReference<Entity<QueryProxy>>) {
+		if (!this.cohortPointerSetNames.get(reference.$relation!)?.length) {
+			return this.local;
+		}
+
+		const origin = this.origins.get(reference.$$item);
+
+		if (origin) {
+			return origin;
+		}
+
+		// a reference to the top level entity of the cohort carries the pointer id
+		if (this.pointerSetNames.has(reference.$relation!)) {
+			return this.requireCohortInstance(reference.$relation!, reference.id);
+		}
+
+		return this.itemInstance(reference.$$item);
 	}
 
 	/**
@@ -770,7 +878,7 @@ export class Database<TContext extends DatabaseContext> {
 	 * Points the pointer to the database with the tag, creates the pointer if it does not exist yet when requested
 	 */
 	private async setPointer(context: DatabaseContext, pointerSetName: string, pointerId: string | number, target: string, create = false) {
-		const meta = this.createPointer(pointerSetName).$$meta;
+		const meta = this.pointerMeta(pointerSetName);
 		const column = identifier(meta.columns.target.name);
 
 		if (create) {
@@ -778,6 +886,18 @@ export class Database<TContext extends DatabaseContext> {
 		} else {
 			await context.$$query(`UPDATE ${identifier(meta.source)} SET ${column} = $2 WHERE id = $1`, [pointerId, target]);
 		}
+	}
+
+	/**
+	 * Inserts a new pointer targeting the local database, returns the id generated for it
+	 *
+	 * pointers are written without audits, they are internal and audits may require a comment
+	 */
+	private async insertPointer(context: DatabaseContext, pointerSetName: string): Promise<string | number> {
+		const meta = this.pointerMeta(pointerSetName);
+		const [[id]] = await context.$$query(`INSERT INTO ${identifier(meta.source)} (${identifier(meta.columns.target.name)}) VALUES ($1) RETURNING id`, [this.tag]);
+
+		return id;
 	}
 
 	/**
@@ -808,7 +928,7 @@ export class Database<TContext extends DatabaseContext> {
 	 * Deletes the pointer, unless it is still referenced
 	 */
 	private async deletePointer(context: DatabaseContext, pointerSetName: string, pointerId: string | number) {
-		const meta = this.createPointer(pointerSetName).$$meta;
+		const meta = this.pointerMeta(pointerSetName);
 
 		try {
 			await context.$$query(`DELETE FROM ${identifier(meta.source)} WHERE id = $1`, [pointerId]);
@@ -834,11 +954,8 @@ export class Database<TContext extends DatabaseContext> {
 		return remote;
 	}
 
-	private createPointer(pointerSetName: string) {
-		const pointer = new (this.set(this.schema, pointerSetName).modelConstructor)() as Entity<QueryProxy> & { target: string };
-		pointer.target = this.tag;
-
-		return pointer;
+	private pointerMeta(pointerSetName: string) {
+		return new (this.set(this.schema, pointerSetName).modelConstructor)().$$meta as Entity<QueryProxy>['$$meta'];
 	}
 
 	private set(context: DatabaseContext, name: string) {
@@ -874,6 +991,11 @@ export class Database<TContext extends DatabaseContext> {
 		}
 	}
 }
+
+/**
+ * Splits the arguments of an operation taking an optional pointer id before the item
+ */
+const splitItemArguments = <TModel>(args: [TModel, string?] | [string | number, TModel, string?]) => (args[0] instanceof Entity ? [undefined, args[0], args[1]] : args) as [string | number | undefined, TModel, string?];
 
 /**
  * Compiled query matching the id, the same vlquery uses for find

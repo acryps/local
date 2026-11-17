@@ -44,6 +44,7 @@ export const isPointer = (type: Function) => type.name.endsWith(pointerSuffix);
  * the structure is validated along, every problem found is collected before throwing a CohortStructureError
  * - a pointer table points to a table, has a target column, shares the id type of the table it points to and references no other tables
  * - a table belongs to one cohort at most, as its rows are stored in one database
+ * - a table of a cohort has an id of type uuid, as its rows are created in and moved between databases
  * - a top level table references the tables of other cohorts through their pointer tables
  */
 export const parseCohorts = (schema: DatabaseContext): Cohorts => {
@@ -106,6 +107,11 @@ export const parseCohorts = (schema: DatabaseContext): Cohorts => {
 
 	for (let [type, pointerSetNames] of cohorts.cohortPointerSetNames) {
 		const model = createModel(type);
+
+		// ids are generated in every database and rows are moved between them, sequences would collide
+		if (pointerSetNames.length && model.$$meta.columns.id?.type != 'uuid') {
+			problems.push(`Table '${model.$$meta.source}' belongs to the cohort of '${cohortSource(pointerSetNames[0])}' but has an id of type '${model.$$meta.columns.id?.type}', cohort tables require ids of type 'uuid' to be unique across all databases`);
+		}
 
 		if (pointerSetNames.length > 1) {
 			problems.push(`Table '${model.$$meta.source}' belongs to multiple cohorts (${pointerSetNames.map(name => `'${cohortSource(name)}'`).join(', ')}), its rows can only be stored in one database. Reference all but one of them through their pointer tables`);
