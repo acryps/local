@@ -26,6 +26,10 @@ The top level table of a cohort (`account`) has a pointer table `account__pointe
 The other tables of the cohort (`picture`) reference the top level table, so they are stored in the same database.
 Pointers are looked up in the local database.
 
+A pointer is followed through the pointers of the databases it targets until one targets itself, which is the database the cohort is stored in.
+A move only updates the pointers of the databases it involves, so other databases may still target the database the cohort left (`EU → US → AP`).
+When such a stale pointer is used, it is updated to target the database the cohort is stored in (`EU → AP`).
+
 ## Operations
 - queries (`where`, `first`, `toArray`, ...): local database only
 - `find(pointerId, id?)`: from the database the pointer targets, `id` defaults to `pointerId` for top level tables

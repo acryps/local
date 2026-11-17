@@ -13,9 +13,9 @@ export type RoutedQueryHooks<TModel> = {
 	prepareTree?(tree: any): any;
 
 	/**
-	 * Called with the loaded items and the trees they have been loaded with, before they are returned
+	 * Called with the loaded items, the trees and the database they have been loaded with, before they are returned
 	 */
-	resolve?(items: TModel[], tree: any): Promise<void>;
+	resolve?(items: TModel[], tree: any, instance: DatabaseInstance<DatabaseContext>): Promise<void>;
 };
 
 /**
@@ -68,41 +68,46 @@ export class RoutedQuery<TModel extends Entity<TQueryProxy> | View<TQueryProxy>,
 	}
 
 	async first(query?: (item: TQueryProxy) => any) {
-		const item = await this.run(queryable => queryable.first(query));
+		const [item, instance] = await this.run(queryable => queryable.first(query));
 
 		if (item) {
-			await this.resolve([item]);
+			await this.resolve([item], instance);
 		}
 
 		return item;
 	}
 
 	async single(query?: (item: TQueryProxy) => any) {
-		const item = await this.run(queryable => queryable.single(query));
-		await this.resolve([item]);
+		const [item, instance] = await this.run(queryable => queryable.single(query));
+		await this.resolve([item], instance);
 
 		return item;
 	}
 
 	async toArray() {
-		const items = await this.run(queryable => queryable.toArray());
-		await this.resolve(items);
+		const [items, instance] = await this.run(queryable => queryable.toArray());
+		await this.resolve(items, instance);
 
 		return items;
 	}
 
-	count() {
-		return this.run(queryable => queryable.count());
+	async count() {
+		const [count] = await this.run(queryable => queryable.count());
+
+		return count;
 	}
 
 	private chain(method: QueryStep['method'], ...args: any[]) {
 		return new RoutedQuery(this.instance, this.source, this.hooks, [...this.steps, { method, args }]);
 	}
 
-	private async run<TResult>(terminal: (queryable: Queryable<TModel, TQueryProxy>) => Promise<TResult>) {
+	/**
+	 * Runs the query, returns the result along with the database it ran in
+	 */
+	private async run<TResult>(terminal: (queryable: Queryable<TModel, TQueryProxy>) => Promise<TResult>): Promise<[TResult, DatabaseInstance<DatabaseContext>]> {
 		const instance = await this.instance();
 
-		return instance.use(context => {
+		const result = await instance.use(context => {
 			let queryable = this.source(context);
 
 			for (let step of this.steps) {
@@ -117,9 +122,11 @@ export class RoutedQuery<TModel extends Entity<TQueryProxy> | View<TQueryProxy>,
 
 			return terminal(queryable);
 		});
+
+		return [result, instance];
 	}
 
-	private async resolve(items: TModel[]) {
+	private async resolve(items: TModel[], instance: DatabaseInstance<DatabaseContext>) {
 		if (this.hooks.resolve) {
 			const tree = {};
 
@@ -129,7 +136,7 @@ export class RoutedQuery<TModel extends Entity<TQueryProxy> | View<TQueryProxy>,
 				}
 			}
 
-			await this.hooks.resolve(items, tree);
+			await this.hooks.resolve(items, tree, instance);
 		}
 	}
 }

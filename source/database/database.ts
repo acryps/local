@@ -393,7 +393,7 @@ export class Database<TContext extends DatabaseContext> {
 	private queryHooks(type: Function): RoutedQueryHooks<any> {
 		return {
 			prepareTree: tree => this.prepareTree(type, tree),
-			resolve: (items, tree) => this.resolveIncludedPointers(items, tree)
+			resolve: (items, tree, instance) => this.resolveIncludedPointers(items, tree, instance as DatabaseInstance<TContext>)
 		};
 	}
 
@@ -436,7 +436,7 @@ export class Database<TContext extends DatabaseContext> {
 		tasks.push(this.local.use(context => context.backload(item, localTree)));
 
 		await Promise.all(tasks);
-		await this.resolveIncludedPointers([item], tree);
+		await this.resolveIncludedPointers([item], tree, this.local);
 	}
 
 	/**
@@ -467,12 +467,14 @@ export class Database<TContext extends DatabaseContext> {
 	 * Replaces included pointers with the entities they point to, loaded from the databases the pointers target
 	 *
 	 * the subtree of a pointer reference in the tree is included in the entity replacing it
+	 *
+	 * @param instance database the items have been loaded from, the included pointers are followed from there
 	 */
-	private async resolveIncludedPointers(items: unknown[], tree?: any) {
-		const loads = new Map<string, Promise<unknown>>();
+	private async resolveIncludedPointers(items: unknown[], tree: any, instance: DatabaseInstance<TContext>) {
+		const loads = new Map<string, Promise<[unknown, DatabaseInstance<TContext>]>>();
 		const visited = new Set<object>();
 
-		const visit = async (item: unknown, tree: any): Promise<void> => {
+		const visit = async (item: unknown, tree: any, origin: DatabaseInstance<TContext>): Promise<void> => {
 			if (!(item instanceof Entity) || visited.has(item)) {
 				return;
 			}
@@ -493,23 +495,27 @@ export class Database<TContext extends DatabaseContext> {
 
 					if (pointedSetName && stored.$stored instanceof reference.$relation!) {
 						const pointer = stored.$stored as Entity<QueryProxy> & { target: string };
-						const load = `${pointedSetName}:${pointer.id}:${JSON.stringify(subtree ?? {})}`;
+						const load = `${origin.tag}:${pointedSetName}:${pointer.id}:${JSON.stringify(subtree ?? {})}`;
 
 						if (!loads.has(load)) {
-							loads.set(load, this.instance(pointer.target).use(context => this.queryPointed(context, pointedSetName, pointer.id, subtree)));
+							loads.set(load, this.followPointer(this.setNames.get(reference.$relation!)!, pointer.id, pointer.target, origin).then(async instance => [
+								await instance.use(context => this.queryPointed(context, pointedSetName, pointer.id, subtree)),
+								instance
+							]));
 						}
 
-						tasks.push(loads.get(load)!.then(pointed => {
+						tasks.push(loads.get(load)!.then(([pointed, instance]) => {
 							stored.$stored = pointed;
 
-							return visit(pointed, subtree);
+							// pointers included in the pointed entity have been loaded from its database
+							return visit(pointed, subtree, instance);
 						}));
 					} else {
-						tasks.push(visit(stored.$stored, subtree));
+						tasks.push(visit(stored.$stored, subtree, origin));
 					}
 				} else if (reference instanceof PrimaryReference) {
 					for (let child of (stored.$stored as unknown[] | undefined) ?? []) {
-						tasks.push(visit(child, subtree));
+						tasks.push(visit(child, subtree, origin));
 					}
 				}
 			}
@@ -517,7 +523,7 @@ export class Database<TContext extends DatabaseContext> {
 			await Promise.all(tasks);
 		};
 
-		await Promise.all(items.map(item => visit(item, tree)));
+		await Promise.all(items.map(item => visit(item, tree, instance)));
 	}
 
 	private async find(type: Function, pointerId: string | number, id: string | number) {
@@ -548,7 +554,7 @@ export class Database<TContext extends DatabaseContext> {
 		}
 
 		const pointed = await instance.use(context => this.queryPointed(context, pointedSetName, id, tree));
-		await this.resolveIncludedPointers([pointed], tree);
+		await this.resolveIncludedPointers([pointed], tree, instance);
 
 		return pointed;
 	}
@@ -597,12 +603,50 @@ export class Database<TContext extends DatabaseContext> {
 	}
 
 	/**
-	 * Database the pointer targets, pointers are looked up in the local database
+	 * Database the pointer leads to, pointers are looked up in the local database
 	 */
 	private async pointerInstance(pointerSetName: string, pointerId: string | number) {
 		const pointer: { target: string } = await this.local.use(context => this.set(context, pointerSetName).find(pointerId));
 
-		return pointer ? this.instance(pointer.target) : null;
+		return pointer ? this.followPointer(pointerSetName, pointerId, pointer.target, this.local) : null;
+	}
+
+	/**
+	 * Database the cohort is stored in, the pointer is followed through the pointers of the databases it targets until one targets itself
+	 *
+	 * a move only updates the pointers of the databases it involves, so other databases may still target the database the cohort left (EU → US → AP)
+	 * when the path is longer than one, the pointer in the origin database is updated to target the database the cohort is stored in (EU → AP)
+	 *
+	 * @param target target of the pointer in the origin database
+	 * @param origin database the pointer has been read from
+	 */
+	private async followPointer(pointerSetName: string, pointerId: string | number, target: string, origin: DatabaseInstance<TContext>) {
+		const path = [origin.tag];
+		let instance = origin;
+
+		while (target != instance.tag) {
+			if (path.includes(target)) {
+				throw new Error(`Pointer '${pointerId}' in '${pointerSetName}' runs in a circle (${[...path, target].join(' → ')})`);
+			}
+
+			path.push(target);
+			instance = this.instance(target);
+
+			const pointer: { target: string } | null = await instance.use(context => this.set(context, pointerSetName).find(pointerId));
+
+			// a deleted cohort takes its pointer along
+			if (!pointer) {
+				break;
+			}
+
+			target = pointer.target;
+		}
+
+		if (path.length > 2) {
+			await origin.use(context => this.setPointer(context, pointerSetName, pointerId, instance.tag));
+		}
+
+		return instance;
 	}
 
 	/**
