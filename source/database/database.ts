@@ -14,6 +14,11 @@ const pointerSuffix = '_Pointer';
 const defaultRemoteIdleTimeout = 60 * 1000;
 
 /**
+ * PostgreSQL error code of a violated foreign key
+ */
+const foreignKeyViolation = '23503';
+
+/**
  * Methods exposed on a set, everything else (like the context) stays hidden
  */
 const setMethods = [
@@ -471,7 +476,7 @@ export class Database<TContext extends DatabaseContext> {
 	 * @param instance database the items have been loaded from, the included pointers are followed from there
 	 */
 	private async resolveIncludedPointers(items: unknown[], tree: any, instance: DatabaseInstance<TContext>) {
-		const loads = new Map<string, Promise<[unknown, DatabaseInstance<TContext>]>>();
+		const loads = new Map<string, Promise<[unknown, DatabaseInstance<TContext> | null]>>();
 		const visited = new Set<object>();
 
 		const visit = async (item: unknown, tree: any, origin: DatabaseInstance<TContext>): Promise<void> => {
@@ -499,7 +504,7 @@ export class Database<TContext extends DatabaseContext> {
 
 						if (!loads.has(load)) {
 							loads.set(load, this.followPointer(this.setNames.get(reference.$relation!)!, pointer.id, pointer.target, origin).then(async instance => [
-								await instance.use(context => this.queryPointed(context, pointedSetName, pointer.id, subtree)),
+								instance && await instance.use(context => this.queryPointed(context, pointedSetName, pointer.id, subtree)),
 								instance
 							]));
 						}
@@ -508,7 +513,7 @@ export class Database<TContext extends DatabaseContext> {
 							stored.$stored = pointed;
 
 							// pointers included in the pointed entity have been loaded from its database
-							return visit(pointed, subtree, instance);
+							return instance ? visit(pointed, subtree, instance) : undefined;
 						}));
 					} else {
 						tasks.push(visit(stored.$stored, subtree, origin));
@@ -617,8 +622,11 @@ export class Database<TContext extends DatabaseContext> {
 	 * a move only updates the pointers of the databases it involves, so other databases may still target the database the cohort left (EU → US → AP)
 	 * when the path is longer than one, the pointer in the origin database is updated to target the database the cohort is stored in (EU → AP)
 	 *
+	 * a deleted cohort takes its pointer along, when the path ends in a database without the pointer, the pointer in the origin database is deleted as well
+	 *
 	 * @param target target of the pointer in the origin database
 	 * @param origin database the pointer has been read from
+	 * @returns null if the cohort has been deleted
 	 */
 	private async followPointer(pointerSetName: string, pointerId: string | number, target: string, origin: DatabaseInstance<TContext>) {
 		const path = [origin.tag];
@@ -634,9 +642,10 @@ export class Database<TContext extends DatabaseContext> {
 
 			const pointer: { target: string } | null = await instance.use(context => this.set(context, pointerSetName).find(pointerId));
 
-			// a deleted cohort takes its pointer along
 			if (!pointer) {
-				break;
+				await origin.use(context => this.deletePointer(context, pointerSetName, pointerId));
+
+				return null;
 			}
 
 			target = pointer.target;
@@ -814,6 +823,22 @@ export class Database<TContext extends DatabaseContext> {
 			await context.$$query(`INSERT INTO ${identifier(meta.source)} (id, ${column}) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET ${column} = EXCLUDED.${column}`, [pointerId, target]);
 		} else {
 			await context.$$query(`UPDATE ${identifier(meta.source)} SET ${column} = $2 WHERE id = $1`, [pointerId, target]);
+		}
+	}
+
+	/**
+	 * Deletes the pointer, unless it is still referenced
+	 */
+	private async deletePointer(context: DatabaseContext, pointerSetName: string, pointerId: string | number) {
+		const meta = this.createPointer(pointerSetName).$$meta;
+
+		try {
+			await context.$$query(`DELETE FROM ${identifier(meta.source)} WHERE id = $1`, [pointerId]);
+		} catch (error) {
+			// rows of other cohorts referencing the pointer keep it alive
+			if ((error as { code?: string }).code != foreignKeyViolation) {
+				throw error;
+			}
 		}
 	}
 

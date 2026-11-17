@@ -29,6 +29,7 @@ Pointers are looked up in the local database.
 A pointer is followed through the pointers of the databases it targets until one targets itself, which is the database the cohort is stored in.
 A move only updates the pointers of the databases it involves, so other databases may still target the database the cohort left (`EU → US → AP`).
 When such a stale pointer is used, it is updated to target the database the cohort is stored in (`EU → AP`).
+When the path ends in a database without the pointer, the cohort has been deleted and the used pointer is deleted as well, unless rows still reference it.
 
 ## Operations
 - queries (`where`, `first`, `toArray`, ...): local database only
@@ -39,7 +40,7 @@ When such a stale pointer is used, it is updated to target the database the coho
 - `create(item)`: top level entities in the local database, they get a pointer to the local database first and share its id. top level entities can not be created in other databases
 - `create(pointerId, item)`: cohort members in the database the pointer targets (`create(chatId, message)`). pointers referenced by the item are not copied, so the insert fails if the target database does not know them
 - `update(pointerId, item)`: in the database the pointer targets
-- `delete(pointerId, item)`: in the database the pointer targets, a top level entity takes its pointer in that database along. pointers in other databases are left as they are
+- `delete(pointerId, item)`: in the database the pointer targets, a top level entity takes its pointer in that database along. pointers in other databases are deleted once they are used
 - `move(item, target)`: moves the cohort of the top level item to the database tagged `target`. the cohort is replicated to the target database, replacing a fraction left there by an interrupted move, then the pointer is created or updated in the target database, the pointer is updated in the source database (and the local database, when it is neither) and the cohort is deleted from the source database. pointers referenced by the cohort are copied to the target database if it does not know them. rows are copied as they are stored, without audits
 - views: local database only
 
