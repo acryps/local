@@ -36,6 +36,7 @@ Pointers are looked up in the local database.
 - `create(pointerId, item)`: cohort members in the database the pointer targets (`create(chatId, message)`). pointers referenced by the item are not copied, so the insert fails if the target database does not know them
 - `update(pointerId, item)`: in the database the pointer targets
 - `delete(pointerId, item)`: in the database the pointer targets, a top level entity takes its pointer in that database along. pointers in other databases are left as they are
+- `move(item, target)`: moves the cohort of the top level item to the database tagged `target`. the cohort is replicated to the target database, replacing a fraction left there by an interrupted move, then the pointer is created or updated in the target database, the pointer is updated in the source database (and the local database, when it is neither) and the cohort is deleted from the source database. pointers referenced by the cohort are copied to the target database if it does not know them. rows are copied as they are stored, without audits
 - views: local database only
 
 The local connection stays open, remote connections are opened on demand and closed after `remoteIdleTimeout`.

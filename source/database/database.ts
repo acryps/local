@@ -283,6 +283,72 @@ export class Database<TContext extends DatabaseContext> {
 		});
 	}
 
+	/**
+	 * Moves the cohort of the top level item to the database with the tag
+	 *
+	 * the cohort is replicated to the target database, replacing a fraction left there by an interrupted move
+	 * then the pointer is created or updated in the target database, the pointer is updated in the source database (and the local database, when it is neither) and the cohort is deleted from the source database
+	 * pointers referenced by the cohort which the target database does not know are copied along
+	 *
+	 * rows are copied as they are stored, without audits
+	 */
+	async move<TModel extends ExposedModel<TContext>>(item: TModel, target: string): Promise<void> {
+		this.requireExposed(item.constructor);
+
+		const pointerSetName = this.pointerSetNames.get(item.constructor);
+
+		if (!pointerSetName) {
+			throw new Error(`'${item.constructor.name}' is not a top level entity, only cohorts can be moved`);
+		}
+
+		const targetInstance = this.instance(target);
+		const sourceInstance = await this.pointerInstance(pointerSetName, item.id);
+
+		if (!sourceInstance) {
+			throw new Error(`No pointer '${item.id}' found for '${item.constructor.name}' in database '${this.tag}'`);
+		}
+
+		if (sourceInstance == targetInstance) {
+			return;
+		}
+
+		const tables = this.cohortTables(item.constructor);
+
+		const { cohort, pointers } = await sourceInstance.use(async context => {
+			const cohort = await this.collectCohort(context, tables, item.id);
+
+			return { cohort, pointers: await this.collectReferencedPointers(context, tables, cohort) };
+		});
+
+		await targetInstance.use(async context => {
+			// an interrupted move may have left a fraction of the cohort
+			await this.deleteCohort(context, tables, await this.collectCohort(context, tables, item.id));
+
+			for (let [source, rows] of pointers) {
+				await context.$$query(`INSERT INTO ${identifier(source)} SELECT * FROM json_populate_recordset(NULL::${identifier(source)}, $1::json) ON CONFLICT (id) DO NOTHING`, [jsonArray(rows)]);
+			}
+
+			for (let table of [...tables].reverse()) {
+				const rows = cohort.get(table)!;
+
+				if (rows.size) {
+					await context.$$query(`INSERT INTO ${identifier(table.source)} SELECT * FROM json_populate_recordset(NULL::${identifier(table.source)}, $1::json)`, [jsonArray(rows.values())]);
+				}
+			}
+
+			await this.setPointer(context, pointerSetName, item.id, target, true);
+		});
+
+		await sourceInstance.use(context => this.setPointer(context, pointerSetName, item.id, target));
+
+		// pointers are looked up in the local database
+		if (this.local != sourceInstance && this.local != targetInstance) {
+			await this.local.use(context => this.setPointer(context, pointerSetName, item.id, target));
+		}
+
+		await sourceInstance.use(context => this.deleteCohort(context, tables, cohort));
+	}
+
 	createDuplicate<TModel extends ExposedModel<TContext>>(item: TModel): TModel {
 		this.requireExposed(item.constructor);
 
@@ -572,6 +638,141 @@ export class Database<TContext extends DatabaseContext> {
 		return [...names];
 	}
 
+	/**
+	 * Tables of the cohort of the top level type, every table after the tables referencing it (children first)
+	 *
+	 * the children of a table are the tables referencing it, except for pointers and top level tables
+	 */
+	private cohortTables(type: Function) {
+		const tables = new Map<Function, CohortTable>();
+		const ordered: CohortTable[] = [];
+
+		const visit = (type: Function) => {
+			if (tables.has(type)) {
+				return tables.get(type)!;
+			}
+
+			const model = new (type as new () => Entity<QueryProxy>)();
+			const table: CohortTable = { source: model.$$meta.source, children: [], pointerColumns: [] };
+
+			tables.set(type, table);
+
+			for (let key in model) {
+				const reference = model[key as keyof typeof model];
+
+				if (reference instanceof PrimaryReference && !this.isPointer(reference.$relation) && !this.pointerSetNames.has(reference.$relation)) {
+					const child = visit(reference.$relation);
+
+					table.children.push({ table: child, column: new reference.$relation().$$meta.columns[reference.$column].name });
+				} else if (reference instanceof ForeignReference && reference.$relation && this.isPointer(reference.$relation)) {
+					table.pointerColumns.push({ source: new reference.$relation().$$meta.source, column: model.$$meta.columns[reference.$column!].name });
+				}
+			}
+
+			ordered.push(table);
+
+			return table;
+		};
+
+		visit(type);
+
+		return ordered;
+	}
+
+	/**
+	 * Rows of the cohort, by their id, read as json so they can be inserted into another database as they are
+	 *
+	 * starts at the top level row and follows the references of the children until no new rows are found
+	 */
+	private async collectCohort(context: DatabaseContext, tables: CohortTable[], pointerId: string | number) {
+		const cohort = new Map<CohortTable, Map<string, string>>(tables.map(table => [table, new Map()]));
+		const root = tables[tables.length - 1];
+
+		const add = (table: CohortTable, rows: [string, string][]) => {
+			const stored = cohort.get(table)!;
+			const added: string[] = [];
+
+			for (let [id, row] of rows) {
+				if (!stored.has(id)) {
+					stored.set(id, row);
+					added.push(row);
+				}
+			}
+
+			return added;
+		};
+
+		const queue: [CohortTable, string[]][] = [[root, add(root, await context.$$query(`SELECT t.id::text, row_to_json(t)::text FROM ${identifier(root.source)} t WHERE t.id = $1`, [pointerId]))]];
+
+		while (queue.length) {
+			const [parent, rows] = queue.shift()!;
+
+			for (let child of parent.children) {
+				const added = add(child.table, await context.$$query(`SELECT t.id::text, row_to_json(t)::text FROM ${identifier(child.table.source)} t WHERE t.${identifier(child.column)} IN (SELECT id FROM json_populate_recordset(NULL::${identifier(parent.source)}, $1::json))`, [jsonArray(rows)]));
+
+				if (added.length) {
+					queue.push([child.table, added]);
+				}
+			}
+		}
+
+		return cohort;
+	}
+
+	/**
+	 * Rows of the pointers referenced by the cohort, by the table of the pointer
+	 */
+	private async collectReferencedPointers(context: DatabaseContext, tables: CohortTable[], cohort: Map<CohortTable, Map<string, string>>) {
+		const pointers = new Map<string, Set<string>>();
+
+		for (let table of tables) {
+			const rows = cohort.get(table)!;
+
+			if (rows.size) {
+				for (let { source, column } of table.pointerColumns) {
+					const found: [string][] = await context.$$query(`SELECT row_to_json(p)::text FROM ${identifier(source)} p WHERE p.id IN (SELECT ${identifier(column)} FROM json_populate_recordset(NULL::${identifier(table.source)}, $1::json))`, [jsonArray(rows.values())]);
+
+					if (!pointers.has(source)) {
+						pointers.set(source, new Set());
+					}
+
+					for (let [row] of found) {
+						pointers.get(source)!.add(row);
+					}
+				}
+			}
+		}
+
+		return pointers;
+	}
+
+	/**
+	 * Deletes the rows of the cohort, children first, pointers are kept
+	 */
+	private async deleteCohort(context: DatabaseContext, tables: CohortTable[], cohort: Map<CohortTable, Map<string, string>>) {
+		for (let table of tables) {
+			const rows = cohort.get(table)!;
+
+			if (rows.size) {
+				await context.$$query(`DELETE FROM ${identifier(table.source)} WHERE id IN (SELECT id FROM json_populate_recordset(NULL::${identifier(table.source)}, $1::json))`, [jsonArray(rows.values())]);
+			}
+		}
+	}
+
+	/**
+	 * Points the pointer to the database with the tag, creates the pointer if it does not exist yet when requested
+	 */
+	private async setPointer(context: DatabaseContext, pointerSetName: string, pointerId: string | number, target: string, create = false) {
+		const meta = this.createPointer(pointerSetName).$$meta;
+		const column = identifier(meta.columns.target.name);
+
+		if (create) {
+			await context.$$query(`INSERT INTO ${identifier(meta.source)} (id, ${column}) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET ${column} = EXCLUDED.${column}`, [pointerId, target]);
+		} else {
+			await context.$$query(`UPDATE ${identifier(meta.source)} SET ${column} = $2 WHERE id = $1`, [pointerId, target]);
+		}
+	}
+
 	private instance(tag: string) {
 		if (tag == this.tag) {
 			return this.local;
@@ -659,3 +860,22 @@ const createWithId = <TModel extends Entity<QueryProxy>>(context: DatabaseContex
 
 	return shadow.create(item, comment);
 };
+
+/**
+ * Table of a cohort, with the tables referencing it and its references to pointers
+ */
+type CohortTable = {
+	source: string;
+	children: { table: CohortTable, column: string }[];
+	pointerColumns: { source: string, column: string }[];
+};
+
+/**
+ * Quoted identifier, the same vlquery uses for table names
+ */
+const identifier = (name: string) => JSON.stringify(name);
+
+/**
+ * Json array of rows already serialized by the database, so their values never pass through javascript numbers
+ */
+const jsonArray = (rows: Iterable<string>) => `[${[...rows].join(',')}]`;
