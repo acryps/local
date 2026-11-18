@@ -2,26 +2,38 @@ import { DatabaseContext, Entity, Query, QueryProxy, Queryable, View } from 'vlq
 import { DatabaseInstance } from './instance';
 
 /**
- * Databases a query reads, the local database, all remote databases or all of them
+ * Databases a query reads, the local database, the remote databases or all of them
  */
 export type QueryScope = 'local' | 'remote' | 'all';
 
 /**
- * Query which runs in the local database, the remote databases or all of them, chosen by its terminal method
- *
- * a query reading multiple databases is merged: ordered by the sorters, then skip and limit are applied to the merged items
- * sorters can only be merged when they select columns of the queried entity (`message => message.created`)
+ * Database a query runs in, limited to the rows with the ids when set
  */
-export interface ScopedQueryable<TModel extends Entity<TQueryProxy> | View<TQueryProxy>, TQueryProxy extends QueryProxy> {
-	where(query: (item: TQueryProxy) => any): ScopedQueryable<TModel, TQueryProxy>;
-	include(selector: (item: TModel) => any): ScopedQueryable<TModel, TQueryProxy>;
-	includeTree(tree: any): ScopedQueryable<TModel, TQueryProxy>;
-	orderByAscending(sorter: (item: TQueryProxy) => any): ScopedQueryable<TModel, TQueryProxy>;
-	orderByDescending(sorter: (item: TQueryProxy) => any): ScopedQueryable<TModel, TQueryProxy>;
-	skip(count: number): ScopedQueryable<TModel, TQueryProxy>;
-	limit(count: number): ScopedQueryable<TModel, TQueryProxy>;
-	page(index: number, size?: number): ScopedQueryable<TModel, TQueryProxy>;
+export type QueryTarget = {
+	instance: DatabaseInstance<DatabaseContext>;
+	ids?: (string | number)[];
+};
 
+/**
+ * Methods building a query, the query is run by its terminal method
+ */
+interface QueryChain<TModel, TQueryProxy extends QueryProxy, TQuery> {
+	where(query: (item: TQueryProxy) => any): TQuery;
+	include(selector: (item: TModel) => any): TQuery;
+	includeTree(tree: any): TQuery;
+	orderByAscending(sorter: (item: TQueryProxy) => any): TQuery;
+	orderByDescending(sorter: (item: TQueryProxy) => any): TQuery;
+	skip(count: number): TQuery;
+	limit(count: number): TQuery;
+	page(index: number, size?: number): TQuery;
+}
+
+/**
+ * Query of a top level table, its terminal method names the databases it reads
+ *
+ * `...Local` reads the local database, `...Remote` the remote databases storing the cohorts the local database has pointers to, `...All` both
+ */
+export interface ScopedQueryable<TModel extends Entity<TQueryProxy> | View<TQueryProxy>, TQueryProxy extends QueryProxy> extends QueryChain<TModel, TQueryProxy, ScopedQueryable<TModel, TQueryProxy>> {
 	firstLocal(query?: (item: TQueryProxy) => any): Promise<TModel>;
 	firstRemote(query?: (item: TQueryProxy) => any): Promise<TModel>;
 	firstAll(query?: (item: TQueryProxy) => any): Promise<TModel>;
@@ -40,12 +52,32 @@ export interface ScopedQueryable<TModel extends Entity<TQueryProxy> | View<TQuer
 }
 
 /**
+ * Query reading a single database
+ */
+export interface LocalQueryable<TModel extends Entity<TQueryProxy> | View<TQueryProxy>, TQueryProxy extends QueryProxy> extends QueryChain<TModel, TQueryProxy, LocalQueryable<TModel, TQueryProxy>> {
+	first(query?: (item: TQueryProxy) => any): Promise<TModel>;
+	single(query?: (item: TQueryProxy) => any): Promise<TModel>;
+	toArray(): Promise<TModel[]>;
+	count(): Promise<number>;
+}
+
+/**
+ * Methods building a query
+ */
+export const chainMethods = ['where', 'include', 'includeTree', 'orderByAscending', 'orderByDescending', 'skip', 'limit', 'page'] as const;
+
+/**
  * Terminal methods of a scoped query, each exposed once per scope (`firstLocal`, `firstRemote`, `firstAll`)
  */
-export const scopedQueryMethods = ['first', 'single', 'toArray', 'count'].flatMap(method => ['Local', 'Remote', 'All'].map(scope => `${method}${scope}`)) as readonly (keyof ScopedQueryable<any, any>)[];
+export const scopedMethods = ['first', 'single', 'toArray', 'count'].flatMap(method => ['Local', 'Remote', 'All'].map(scope => `${method}${scope}`)) as readonly (keyof ScopedQueryable<any, any>)[];
+
+/**
+ * Terminal methods of a query reading a single database
+ */
+export const localMethods = ['first', 'single', 'toArray', 'count'] as const;
 
 type QueryStep = {
-	method: 'where' | 'include' | 'includeTree' | 'orderByAscending' | 'orderByDescending' | 'skip' | 'limit' | 'page';
+	method: typeof chainMethods[number];
 	args: any[];
 };
 
@@ -58,31 +90,35 @@ type Order = { sorter: Sorter, direction: 1 | -1 };
 
 export type RoutedQueryHooks<TModel> = {
 	/**
-	 * Rewrites a tree before it is passed to vlquery
+	 * Rewrites the tree before it is passed to vlquery
 	 */
 	prepareTree?(tree: any): any;
 
 	/**
-	 * Called with the loaded items, the trees and the database they have been loaded with, before they are returned
+	 * Called with the loaded items, the tree and the database they have been loaded from, before they are returned
 	 */
 	resolve?(items: TModel[], tree: any, instance: DatabaseInstance<DatabaseContext>): Promise<void>;
 };
 
 /**
- * Query executed in the databases of the scope of its terminal method
+ * Query executed in the databases its route leads to
  *
  * the steps are recorded and replayed on the context of each database, as a vlquery query is bound to its context
+ * includes are merged into a single tree, which is passed to vlquery after the hooks prepared it
  */
-export class RoutedQuery<TModel extends Entity<TQueryProxy> | View<TQueryProxy>, TQueryProxy extends QueryProxy> implements ScopedQueryable<TModel, TQueryProxy> {
+export class RoutedQuery<TModel extends Entity<TQueryProxy> | View<TQueryProxy>, TQueryProxy extends QueryProxy> implements ScopedQueryable<TModel, TQueryProxy>, LocalQueryable<TModel, TQueryProxy> {
+	/**
+	 * @param route databases the query reads for the scope, the plain terminal methods read the 'local' scope
+	 */
 	constructor(
 		private readonly type: Function,
-		private readonly instances: (scope: QueryScope) => DatabaseInstance<DatabaseContext>[],
+		private readonly route: (scope: QueryScope) => Promise<QueryTarget[]>,
 		private readonly source: (context: DatabaseContext) => Queryable<TModel, TQueryProxy>,
 		private readonly hooks: RoutedQueryHooks<TModel> = {},
 		private readonly steps: QueryStep[] = []
 	) {}
 
-	toQuery(): ScopedQueryable<TModel, TQueryProxy> {
+	toQuery() {
 		return this;
 	}
 
@@ -118,28 +154,40 @@ export class RoutedQuery<TModel extends Entity<TQueryProxy> | View<TQueryProxy>,
 		return this.chain('page', index, size);
 	}
 
+	first(query?: (item: TQueryProxy) => any) {
+		return this.loadFirst('local', query);
+	}
+
 	firstLocal(query?: (item: TQueryProxy) => any) {
-		return this.first('local', query);
+		return this.loadFirst('local', query);
 	}
 
 	firstRemote(query?: (item: TQueryProxy) => any) {
-		return this.first('remote', query);
+		return this.loadFirst('remote', query);
 	}
 
 	firstAll(query?: (item: TQueryProxy) => any) {
-		return this.first('all', query);
+		return this.loadFirst('all', query);
+	}
+
+	single(query?: (item: TQueryProxy) => any) {
+		return this.loadSingle('local', query);
 	}
 
 	singleLocal(query?: (item: TQueryProxy) => any) {
-		return this.single('local', query);
+		return this.loadSingle('local', query);
 	}
 
 	singleRemote(query?: (item: TQueryProxy) => any) {
-		return this.single('remote', query);
+		return this.loadSingle('remote', query);
 	}
 
 	singleAll(query?: (item: TQueryProxy) => any) {
-		return this.single('all', query);
+		return this.loadSingle('all', query);
+	}
+
+	toArray() {
+		return this.load('local', this.steps);
 	}
 
 	toArrayLocal() {
@@ -154,25 +202,29 @@ export class RoutedQuery<TModel extends Entity<TQueryProxy> | View<TQueryProxy>,
 		return this.load('all', this.steps);
 	}
 
+	count() {
+		return this.loadCount('local');
+	}
+
 	countLocal() {
-		return this.count('local');
+		return this.loadCount('local');
 	}
 
 	countRemote() {
-		return this.count('remote');
+		return this.loadCount('remote');
 	}
 
 	countAll() {
-		return this.count('all');
+		return this.loadCount('all');
 	}
 
-	private async first(scope: QueryScope, query?: (item: TQueryProxy) => any) {
+	private async loadFirst(scope: QueryScope, query?: (item: TQueryProxy) => any) {
 		const [item] = await this.load(scope, this.filtered(query), 1);
 
 		return item;
 	}
 
-	private async single(scope: QueryScope, query?: (item: TQueryProxy) => any) {
+	private async loadSingle(scope: QueryScope, query?: (item: TQueryProxy) => any) {
 		const items = await this.load(scope, this.filtered(query), 2);
 
 		if (items.length != 1) {
@@ -182,14 +234,15 @@ export class RoutedQuery<TModel extends Entity<TQueryProxy> | View<TQueryProxy>,
 		return items[0];
 	}
 
-	private async count(scope: QueryScope) {
-		const counts = await Promise.all(this.instances(scope).map(instance => instance.use(context => this.replay(context, this.steps).count())));
+	private async loadCount(scope: QueryScope) {
+		const targets = await this.route(scope);
+		const counts = await Promise.all(targets.map(target => target.instance.use(context => this.replay(context, target, this.steps).count())));
 
 		return counts.reduce((sum, count) => sum + count, 0);
 	}
 
 	private chain(method: QueryStep['method'], ...args: any[]) {
-		return new RoutedQuery(this.type, this.instances, this.source, this.hooks, [...this.steps, { method, args }]);
+		return new RoutedQuery(this.type, this.route, this.source, this.hooks, [...this.steps, { method, args }]);
 	}
 
 	private filtered(query?: (item: TQueryProxy) => any): QueryStep[] {
@@ -204,13 +257,14 @@ export class RoutedQuery<TModel extends Entity<TQueryProxy> | View<TQueryProxy>,
 	 * @param take overrides the limit, like vlquery does for first and single
 	 */
 	private async load(scope: QueryScope, steps: QueryStep[], take?: number) {
-		const instances = this.instances(scope);
+		const targets = await this.route(scope);
+		const tree = this.tree(steps);
 
-		if (instances.length == 1) {
-			const [instance] = instances;
-			const items = await instance.use(context => this.replay(context, take === undefined ? steps : [...steps, { method: 'limit', args: [take] }]).toArray());
+		if (targets.length == 1) {
+			const [target] = targets;
+			const items = await target.instance.use(context => this.replay(context, target, take === undefined ? steps : [...steps, { method: 'limit', args: [take] }], tree).toArray());
 
-			await this.resolve(items, instance);
+			await this.resolve(items, tree, target.instance);
 
 			return items;
 		}
@@ -226,31 +280,26 @@ export class RoutedQuery<TModel extends Entity<TQueryProxy> | View<TQueryProxy>,
 			direction: step.method == 'orderByAscending' ? 1 : -1
 		}) as Order);
 
-		const columns = new Set(orders.flatMap(order => this.sortColumns(order.sorter)));
+		// the merge compares the sorted columns, a tree may leave them out
+		const columns = orders.flatMap(order => this.sortColumns(order.sorter));
+		const mergeTree = tree && { ...tree, ...Object.fromEntries(columns.map(column => [column, true])) };
 
-		const instanceSteps: QueryStep[] = steps.filter(step => step.method != 'skip' && step.method != 'limit' && step.method != 'page').map(step => {
-			// the merge compares the sorted columns, a tree may leave them out
-			if (step.method == 'includeTree' && columns.size) {
-				return { method: step.method, args: [{ ...step.args[0], ...Object.fromEntries([...columns].map(column => [column, true])) }] };
-			}
-
-			return step;
-		});
+		const targetSteps = steps.filter(step => step.method != 'skip' && step.method != 'limit' && step.method != 'page');
 
 		if (limit !== undefined) {
-			instanceSteps.push({ method: 'limit', args: [skip + limit] });
+			targetSteps.push({ method: 'limit', args: [skip + limit] });
 		}
 
-		const loaded = await Promise.all(instances.map(instance => instance.use(context => this.replay(context, instanceSteps).toArray()).then(items => items.map(item => [item, instance] as const))));
+		const loaded = await Promise.all(targets.map(target => target.instance.use(context => this.replay(context, target, targetSteps, mergeTree).toArray()).then(items => items.map(item => [item, target.instance] as const))));
 
 		// the sort is stable, equal items keep the order of their databases
 		const merged = loaded.flat().sort((left, right) => compareItems(orders, left[0], right[0]));
 		const kept = merged.slice(skip, limit === undefined ? undefined : skip + limit);
 
-		await Promise.all(instances.map(instance => {
+		await Promise.all(targets.map(({ instance }) => {
 			const items = kept.filter(([, origin]) => origin == instance).map(([item]) => item);
 
-			return items.length ? this.resolve(items, instance) : undefined;
+			return items.length ? this.resolve(items, tree, instance) : undefined;
 		}));
 
 		return kept.map(([item]) => item);
@@ -273,36 +322,79 @@ export class RoutedQuery<TModel extends Entity<TQueryProxy> | View<TQueryProxy>,
 		throw new Error(`Query of '${this.type.name}' reading multiple databases can only be ordered by its columns, ${JSON.stringify(sorter)} can not be merged`);
 	}
 
-	private replay(context: DatabaseContext, steps: QueryStep[]) {
-		let queryable = this.source(context);
+	/**
+	 * Tree of the includes, include adds the path of its selector to the tree, includeTree replaces it, like in vlquery
+	 */
+	private tree(steps: QueryStep[]) {
+		let tree: any;
 
 		for (let step of steps) {
-			let args = step.args;
-
-			if (step.method == 'includeTree' && this.hooks.prepareTree) {
-				args = [this.hooks.prepareTree(args[0])];
+			if (step.method == 'includeTree') {
+				tree = structuredClone(step.args[0]);
+			} else if (step.method == 'include') {
+				tree = selectorTree(this.type, step.args[0], tree ?? {});
 			}
+		}
 
-			queryable = (queryable[step.method] as Function).apply(queryable, args);
+		return tree;
+	}
+
+	private replay(context: DatabaseContext, target: QueryTarget, steps: QueryStep[], tree?: any) {
+		let queryable = this.source(context);
+
+		if (target.ids) {
+			queryable = queryable.where({ call: { stack: ['id', { name: 'includedIn', parameters: [{ value: target.ids }] }] } } as any);
+		}
+
+		for (let step of steps) {
+			if (step.method != 'include' && step.method != 'includeTree') {
+				queryable = (queryable[step.method] as Function).apply(queryable, step.args);
+			}
+		}
+
+		if (tree) {
+			queryable = queryable.includeTree(this.hooks.prepareTree ? this.hooks.prepareTree(tree) : tree);
 		}
 
 		return queryable;
 	}
 
-	private async resolve(items: TModel[], instance: DatabaseInstance<DatabaseContext>) {
-		if (this.hooks.resolve) {
-			const tree = {};
-
-			for (let step of this.steps) {
-				if (step.method == 'includeTree') {
-					Object.assign(tree, step.args[0]);
-				}
-			}
-
-			await this.hooks.resolve(items, tree, instance);
-		}
+	private async resolve(items: TModel[], tree: any, instance: DatabaseInstance<DatabaseContext>) {
+		await this.hooks.resolve?.(items, tree ?? {}, instance);
 	}
 }
+
+/**
+ * Adds the path of the selector to the tree, with the columns of every entity along it, the same way vlquery does
+ */
+const selectorTree = (type: Function, selector: Function, tree: any) => {
+	const [parameter, body] = selector.toString().split('=>');
+	const path = body.replace(`${parameter.trim().replace(/\(|\)/g, '')}.`, '').trim().split('.');
+
+	let model = new (type as new () => Entity<QueryProxy>)();
+	let leaf = tree;
+
+	for (let key in model.$$meta.columns) {
+		tree[key] = true;
+	}
+
+	for (let property of path) {
+		const relation = (model[property as keyof typeof model] as unknown as { $relation: new () => Entity<QueryProxy> }).$relation;
+
+		if (typeof leaf[property] != 'object') {
+			leaf[property] = {};
+		}
+
+		leaf = leaf[property];
+		model = new relation();
+
+		for (let key in model.$$meta.columns) {
+			leaf[key] = true;
+		}
+	}
+
+	return tree;
+};
 
 /**
  * Skip and limit of the steps, the last step setting them wins, like in vlquery

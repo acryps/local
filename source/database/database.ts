@@ -1,10 +1,14 @@
 import { DatabaseContext, DbClient, DbSet, Entity, ForeignReference, PrimaryReference, QueryProxy, ViewSet } from 'vlquery';
+import { MemberSet, RootSet } from '../structure';
 import { DatabaseConfiguration } from '../types/database-configuration';
-import { isPointer, parseCohorts, pointerSuffix } from './cohorts';
+import { collectCohort, collectReferencedPointers, deleteCohort, insertCohort } from './cohort-rows';
+import { Cohort, Cohorts } from './cohorts';
 import { DatabaseInstance } from './instance';
-import { QueryScope, RoutedQuery, RoutedQueryHooks, ScopedQueryable, scopedQueryMethods } from './routed-query';
+import { Pointers } from './pointers';
+import { References } from './references';
+import { LocalQueryable, QueryScope, QueryTarget, RoutedQuery, RoutedQueryHooks, ScopedQueryable, chainMethods, localMethods, scopedMethods } from './routed-query';
 
-export { QueryScope, ScopedQueryable } from './routed-query';
+export { LocalQueryable, QueryScope, ScopedQueryable } from './routed-query';
 
 /**
  * Milliseconds a remote connection stays open after its last use
@@ -12,66 +16,62 @@ export { QueryScope, ScopedQueryable } from './routed-query';
 const defaultRemoteIdleTimeout = 60 * 1000;
 
 /**
- * PostgreSQL error code of a violated foreign key
- */
-const foreignKeyViolation = '23503';
-
-/**
- * Methods exposed on sets and views, everything else (like the context) stays hidden
- */
-const queryMethods = [
-	'find',
-	'toQuery',
-	'where',
-	'include',
-	'includeTree',
-	'orderByAscending',
-	'orderByDescending',
-	'skip',
-	'limit',
-	'page'
-] as const;
-
-/**
  * Methods exposed on a view, views only read the local database
  */
-const viewMethods = [...queryMethods, 'first', 'single', 'toArray', 'count'] as const;
+const viewMethods = ['find', 'toQuery', ...chainMethods, 'first', 'single', 'toArray', 'count'] as const;
 
 /**
- * Methods exposed on a set, its terminal methods name the databases they read (`toArrayLocal`, `toArrayRemote`, `toArrayAll`)
+ * Names of the sets of the context
  */
-const setMethods = [...queryMethods, ...scopedQueryMethods];
-
-/**
- * Names of the sets which are not pointers
- *
- * the generator names sets after their tables, just like their entity classes, so they share the '_Pointer' suffix
- */
-export type ExposedSetName<TContext> = {
-	[Key in keyof TContext]: Key extends `${string}${typeof pointerSuffix}` ? never : TContext[Key] extends DbSet<any, any> ? Key : never
+export type SetName<TContext> = {
+	[Key in keyof TContext]: TContext[Key] extends DbSet<any, any> ? Key : never
 }[keyof TContext] & string;
 
 /**
- * Set reduced to its public methods, terminal methods name the databases they read, find is located by the pointer of the cohort
+ * Set of a top level table, terminal methods name the databases they read, find is located by the pointer of the entity
  */
-export type ExposedSet<TSet> = (TSet extends DbSet<infer TModel, infer TQueryProxy> ? ScopedQueryable<TModel, TQueryProxy> & {
+export type ExposedRootSet<TModel extends Entity<TQueryProxy>, TQueryProxy extends QueryProxy> = ScopedQueryable<TModel, TQueryProxy> & {
 	toQuery(): ScopedQueryable<TModel, TQueryProxy>;
-} : never) & {
+
+	/**
+	 * Loads the entity from the database its pointer targets
+	 */
+	find(id: string | number): Promise<TModel>;
+};
+
+/**
+ * Set of a table of a cohort below its top level table, queries read the local database, find is located by the pointer of the cohort
+ */
+export type ExposedMemberSet<TModel extends Entity<TQueryProxy>, TQueryProxy extends QueryProxy> = LocalQueryable<TModel, TQueryProxy> & {
+	toQuery(): LocalQueryable<TModel, TQueryProxy>;
+
 	/**
 	 * Loads the entity from the database the pointer of its cohort targets
 	 *
 	 * @param pointerId id of the top level entity of the cohort (`message.find(chatId, messageId)`)
-	 * @param id id of the entity, defaults to the pointer id for top level entities (`account.find(accountId)`)
 	 */
-	find(pointerId: string | number, id?: string | number): Promise<ModelOf<TSet>>;
+	find(pointerId: string | number, id: string | number): Promise<TModel>;
 };
+
+/**
+ * Set of a table which is not part of a cohort, its rows are stored in the local database
+ */
+export type ExposedLocalSet<TModel extends Entity<TQueryProxy>, TQueryProxy extends QueryProxy> = LocalQueryable<TModel, TQueryProxy> & {
+	toQuery(): LocalQueryable<TModel, TQueryProxy>;
+	find(id: string | number): Promise<TModel>;
+};
+
+export type ExposedSet<TSet> = TSet extends RootSet<infer TModel, infer TQueryProxy> ? ExposedRootSet<TModel, TQueryProxy>
+	: TSet extends MemberSet<infer TModel, infer TQueryProxy> ? ExposedMemberSet<TModel, TQueryProxy>
+	: TSet extends DbSet<infer TModel, infer TQueryProxy> ? ExposedLocalSet<TModel, TQueryProxy>
+	: never;
 
 /**
  * View reduced to its public methods
  */
 export type ExposedView<TSet> = Pick<TSet, typeof viewMethods[number] & keyof TSet>;
 
-export type ExposedSets<TContext> = { readonly [Name in ExposedSetName<TContext>]: ExposedSet<TContext[Name]> };
+export type ExposedSets<TContext> = { readonly [Name in SetName<TContext>]: ExposedSet<TContext[Name]> };
 export type ExposedViews<TContext> = TContext extends { views: infer TViews } ? { readonly [Name in keyof TViews]: ExposedView<TViews[Name]> } : {};
 
 /**
@@ -80,18 +80,16 @@ export type ExposedViews<TContext> = TContext extends { views: infer TViews } ? 
 export type ModelOf<TSet> = TSet extends DbSet<infer TModel, any> ? TModel : never;
 
 /**
- * Entities of the sets which are not pointers
+ * Entities of the context
  */
-export type ExposedModel<TContext> = ModelOf<TContext[ExposedSetName<TContext>]>;
+export type ExposedModel<TContext> = ModelOf<TContext[SetName<TContext>]>;
 
 /**
- * Entity a pointer model points to, or the model itself if it is not a pointer
+ * Entities of the tables of cohorts below their top level tables
  */
-export type PointedModel<TContext, TModel> = [TModel] extends [ModelOf<TContext[keyof TContext]>] ? ({
-	[Key in keyof TContext]: Key extends `${infer Base}${typeof pointerSuffix}`
-		? (ModelOf<TContext[Key]> extends TModel ? (Base extends keyof TContext ? ModelOf<TContext[Base]> : never) : never)
-		: never
-}[keyof TContext] extends infer TPointed ? ([TPointed] extends [never] ? TModel : TPointed) : never) : TModel;
+export type MemberModel<TContext> = {
+	[Name in SetName<TContext>]: TContext[Name] extends MemberSet<any, any> ? ModelOf<TContext[Name]> : never
+}[SetName<TContext>];
 
 /**
  * Single database distributed over multiple locations
@@ -99,7 +97,8 @@ export type PointedModel<TContext, TModel> = [TModel] extends [ModelOf<TContext[
  * the top level table of a cohort has a pointer table, which names the database (by its tag) the cohort is stored in
  * the other tables of the cohort reference the top level table, so their rows are stored in the same database
  *
- * queries read the local database, the remote databases or all of them, as named by their terminal method (`toArrayLocal`, `toArrayRemote`, `toArrayAll`)
+ * queries of top level tables read the local database, the remote databases or all of them, as named by their terminal method (`toArrayLocal`, `toArrayRemote`, `toArrayAll`)
+ * queries of other tables read the local database
  * entities are loaded from remote databases by following a pointer, either a reference to a pointer or the pointer id passed to find, update and delete
  */
 export class Database<TContext extends DatabaseContext> {
@@ -119,27 +118,14 @@ export class Database<TContext extends DatabaseContext> {
 	 */
 	private readonly schema: TContext;
 
-	private readonly setNames: Map<Function, string>;
-
-	/**
-	 * Top level type to the name of its pointer set
-	 */
-	private readonly pointerSetNames: Map<Function, string>;
-
-	/**
-	 * Pointer type to the name of the set it points to
-	 */
-	private readonly pointedSetNames: Map<Function, string>;
-
-	/**
-	 * Type to the names of the pointer sets of the cohorts it belongs to
-	 */
-	private readonly cohortPointerSetNames: Map<Function, string[]>;
+	private readonly cohorts: Cohorts;
+	private readonly pointers: Pointers;
+	private readonly references: References;
 
 	/**
 	 * Database each loaded or written entity is stored in, entities do not remember it themselves
 	 */
-	private readonly origins = new WeakMap<object, DatabaseInstance<TContext>>();
+	private readonly origins = new WeakMap<object, DatabaseInstance<DatabaseContext>>();
 
 	constructor(configuration: DatabaseConfiguration<TContext>) {
 		this.tag = configuration.local.tag;
@@ -155,22 +141,27 @@ export class Database<TContext extends DatabaseContext> {
 
 		this.schema = new configuration.context(new DbClient(), configuration.runContext);
 
-		// throws if the structure can not be parsed into cohorts
-		({
-			setNames: this.setNames,
-			pointerSetNames: this.pointerSetNames,
-			pointedSetNames: this.pointedSetNames,
-			cohortPointerSetNames: this.cohortPointerSetNames
-		} = parseCohorts(this.schema));
+		this.cohorts = new Cohorts(this.schema, configuration.context.$$cohorts);
+		this.pointers = new Pointers(this.local, tag => this.instance(tag));
+		this.references = new References(this.cohorts, this.pointers, this.local, this.origins, (context, type) => this.set(context, type));
 
 		const sets: Record<string, object> = {};
 
-		for (let [type, name] of this.setNames) {
-			if (!this.isPointer(type)) {
-				sets[name] = this.exposeSet(
-					(pointerId: string | number, id = pointerId) => this.find(type, pointerId, id),
-					() => new RoutedQuery(type, scope => this.scopeInstances(scope), context => this.set(context, name).toQuery(), this.queryHooks(type)),
-					setMethods
+		for (let type of this.cohorts.setNames.keys()) {
+			const cohort = this.cohorts.cohort(type);
+			const query = (route: (scope: QueryScope) => Promise<QueryTarget[]>) => new RoutedQuery(type, route, context => this.set(context, type).toQuery(), this.queryHooks(type));
+
+			if (cohort?.root == type) {
+				sets[this.cohorts.setNames.get(type)!] = this.exposeSet(
+					(id: string | number) => this.find(type, id, id),
+					() => query(scope => this.rootTargets(cohort, scope)),
+					scopedMethods
+				);
+			} else {
+				sets[this.cohorts.setNames.get(type)!] = this.exposeSet(
+					cohort ? (pointerId: string | number, id: string | number) => this.find(type, pointerId, id) : (id: string | number) => this.find(type, id, id),
+					() => query(async () => [{ instance: this.local }]),
+					localMethods
 				);
 			}
 		}
@@ -216,44 +207,49 @@ export class Database<TContext extends DatabaseContext> {
 	 *
 	 * @param pointerId id of the top level entity of the cohort (`create(chatId, message)`)
 	 */
-	async create<TModel extends ExposedModel<TContext>>(pointerId: string | number, item: TModel, comment?: string): Promise<TModel>;
+	async create<TModel extends MemberModel<TContext>>(pointerId: string | number, item: TModel, comment?: string): Promise<TModel>;
 
 	async create<TModel extends ExposedModel<TContext>>(...args: [TModel, string?] | [string | number, TModel, string?]): Promise<TModel> {
 		const [pointerId, item, comment] = splitItemArguments(args);
+		const type = item.constructor;
 
-		this.requireExposed(item.constructor);
+		this.requireExposed(type);
 
-		const pointerSetName = this.pointerSetNames.get(item.constructor);
+		const cohort = this.cohorts.cohort(type);
 
-		if (pointerSetName) {
+		if (cohort?.root == type) {
 			// top level items are always created in the local database
 			if (pointerId !== undefined) {
-				throw new Error(`'${item.constructor.name}' is a top level entity and can only be created in database '${this.tag}'`);
+				throw new Error(`'${type.name}' is a top level entity and can only be created in database '${this.tag}'`);
 			}
 
-			const created = await this.local.use(async context => createWithId(context, item, await this.insertPointer(context, pointerSetName), comment));
+			const created = await this.local.use(async context => createWithId(context, item, await this.pointers.insert(context, cohort, this.tag), comment));
 			this.origins.set(created, this.local);
 
-			await this.createReferencingPointers(created, pointerSetName);
+			await this.createReferencingPointers(created, cohort);
 
 			return created;
 		}
 
-		if (this.cohortPointerSetNames.get(item.constructor)?.length) {
+		if (cohort) {
 			if (pointerId === undefined) {
-				throw new Error(`'${item.constructor.name}' is part of a cohort, the pointer id is required to create it`);
+				throw new Error(`'${type.name}' is part of the cohort of '${cohort.root.name}', the pointer id is required to create it`);
 			}
 
-			const instance = await this.requireCohortInstance(item.constructor, pointerId);
+			const instance = await this.requireCohortInstance(cohort, pointerId);
 
 			return this.remember(await instance.use(context => context.create(item, comment)), instance);
+		}
+
+		if (pointerId !== undefined) {
+			throw new Error(`'${type.name}' is not part of a cohort and can only be created in database '${this.tag}'`);
 		}
 
 		return this.remember(await this.local.use(context => context.create(item, comment)), this.local);
 	}
 
 	/**
-	 * Updates the item in the database it has been loaded from
+	 * Updates the item in the database it is stored in
 	 *
 	 * a top level item, or an item which is not part of a cohort, does not have to be loaded through this database
 	 */
@@ -264,7 +260,7 @@ export class Database<TContext extends DatabaseContext> {
 	 *
 	 * @param pointerId id of the top level entity of the cohort (`update(chatId, message)`)
 	 */
-	async update<TModel extends ExposedModel<TContext>>(pointerId: string | number, item: TModel, comment?: string): Promise<TModel>;
+	async update<TModel extends MemberModel<TContext>>(pointerId: string | number, item: TModel, comment?: string): Promise<TModel>;
 
 	async update<TModel extends ExposedModel<TContext>>(...args: [TModel, string?] | [string | number, TModel, string?]): Promise<TModel> {
 		const [pointerId, item, comment] = splitItemArguments(args);
@@ -277,7 +273,7 @@ export class Database<TContext extends DatabaseContext> {
 	}
 
 	/**
-	 * Deletes the item from the database it has been loaded from
+	 * Deletes the item from the database it is stored in
 	 *
 	 * a top level item, or an item which is not part of a cohort, does not have to be loaded through this database
 	 * a top level item takes its pointer in that database along, unless rows of other cohorts still reference it, pointers in other databases are left as they are
@@ -290,7 +286,7 @@ export class Database<TContext extends DatabaseContext> {
 	 *
 	 * @param pointerId id of the top level entity of the cohort (`delete(chatId, message)`)
 	 */
-	async delete<TModel extends ExposedModel<TContext>>(pointerId: string | number, item: TModel, comment?: string): Promise<void>;
+	async delete<TModel extends MemberModel<TContext>>(pointerId: string | number, item: TModel, comment?: string): Promise<void>;
 
 	async delete<TModel extends ExposedModel<TContext>>(...args: [TModel, string?] | [string | number, TModel, string?]): Promise<void> {
 		const [pointerId, item, comment] = splitItemArguments(args);
@@ -298,13 +294,13 @@ export class Database<TContext extends DatabaseContext> {
 		this.requireExposed(item.constructor);
 
 		const instance = await this.itemInstance(item, pointerId);
-		const pointerSetName = this.pointerSetNames.get(item.constructor);
+		const cohort = this.cohorts.rootCohort(item.constructor);
 
 		await instance.use(async context => {
 			await context.delete(item, comment);
 
-			if (pointerSetName && !item.$$meta.active) {
-				await this.deletePointer(context, pointerSetName, item.id);
+			if (cohort && !item.$$meta.active) {
+				await this.pointers.delete(context, cohort, item.id);
 			}
 		});
 	}
@@ -313,7 +309,8 @@ export class Database<TContext extends DatabaseContext> {
 	 * Moves the cohort of the top level item to the database with the tag
 	 *
 	 * the cohort is replicated to the target database, replacing a fraction left there by an interrupted move
-	 * then the pointer is created or updated in the target database, the pointer is updated in the source database (and the local database, when it is neither) and the cohort is deleted from the source database
+	 * then the pointer is created or updated in the target database, the pointer is updated in the source database and the cohort is deleted from the source database
+	 * other databases still target the source database, their pointers are updated once they are followed
 	 * pointers referenced by the cohort which the target database does not know are copied along
 	 *
 	 * rows are copied as they are stored, without audits
@@ -321,58 +318,39 @@ export class Database<TContext extends DatabaseContext> {
 	async move<TModel extends ExposedModel<TContext>>(item: TModel, target: string): Promise<void> {
 		this.requireExposed(item.constructor);
 
-		const pointerSetName = this.pointerSetNames.get(item.constructor);
+		const cohort = this.cohorts.rootCohort(item.constructor);
 
-		if (!pointerSetName) {
+		if (!cohort) {
 			throw new Error(`'${item.constructor.name}' is not a top level entity, only cohorts can be moved`);
 		}
 
 		const targetInstance = this.instance(target);
-		const sourceInstance = await this.pointerInstance(pointerSetName, item.id);
-
-		if (!sourceInstance) {
-			throw new Error(`No pointer '${item.id}' found for '${item.constructor.name}' in database '${this.tag}'`);
-		}
+		const sourceInstance = await this.requireCohortInstance(cohort, item.id);
 
 		if (sourceInstance == targetInstance) {
 			return;
 		}
 
-		const tables = this.cohortTables(item.constructor);
+		const { rows, pointers } = await sourceInstance.use(async context => {
+			const rows = await collectCohort(context, cohort.tables, item.id);
 
-		const { cohort, pointers } = await sourceInstance.use(async context => {
-			const cohort = await this.collectCohort(context, tables, item.id);
-
-			return { cohort, pointers: await this.collectReferencedPointers(context, tables, cohort) };
+			return { rows, pointers: await collectReferencedPointers(context, cohort.tables, rows) };
 		});
 
 		await targetInstance.use(async context => {
 			// an interrupted move may have left a fraction of the cohort
-			await this.deleteCohort(context, tables, await this.collectCohort(context, tables, item.id));
+			await deleteCohort(context, cohort.tables, await collectCohort(context, cohort.tables, item.id));
+			await insertCohort(context, cohort.tables, rows, pointers);
 
-			for (let [source, rows] of pointers) {
-				await context.$$query(`INSERT INTO ${identifier(source)} SELECT * FROM json_populate_recordset(NULL::${identifier(source)}, $1::json) ON CONFLICT (id) DO NOTHING`, [jsonArray(rows)]);
-			}
-
-			for (let table of [...tables].reverse()) {
-				const rows = cohort.get(table)!;
-
-				if (rows.size) {
-					await context.$$query(`INSERT INTO ${identifier(table.source)} SELECT * FROM json_populate_recordset(NULL::${identifier(table.source)}, $1::json)`, [jsonArray(rows.values())]);
-				}
-			}
-
-			await this.setPointer(context, pointerSetName, item.id, target, true);
+			await this.pointers.set(context, cohort, item.id, target, true);
 		});
 
-		await sourceInstance.use(context => this.setPointer(context, pointerSetName, item.id, target));
+		await sourceInstance.use(async context => {
+			await this.pointers.set(context, cohort, item.id, target);
+			await deleteCohort(context, cohort.tables, rows);
+		});
 
-		// pointers are looked up in the local database
-		if (this.local != sourceInstance && this.local != targetInstance) {
-			await this.local.use(context => this.setPointer(context, pointerSetName, item.id, target));
-		}
-
-		await sourceInstance.use(context => this.deleteCohort(context, tables, cohort));
+		this.origins.set(item, targetInstance);
 	}
 
 	createDuplicate<TModel extends ExposedModel<TContext>>(item: TModel): TModel {
@@ -384,71 +362,61 @@ export class Database<TContext extends DatabaseContext> {
 	/**
 	 * Loads the referenced entity
 	 *
-	 * a reference to a pointer loads the entity it points to from the targeted database, other references load from the local database
+	 * a reference to a pointer loads the entity it points to from the database the pointer targets
+	 * a reference within a cohort loads from the database the cohort is stored in, other references load from the local database
 	 */
-	async fetch<TModel extends Entity<QueryProxy>>(reference: Partial<ForeignReference<TModel>>): Promise<PointedModel<TContext, TModel>> {
-		const stored = (reference as unknown as { $stored: unknown }).$stored;
-
-		if (reference.$relation && this.pointedSetNames.has(reference.$relation)) {
-			const pointedType = this.set(this.schema, this.pointedSetNames.get(reference.$relation)!).modelConstructor;
-
-			// included pointers have already been replaced by the entity they point to
-			if (reference.hasPrefetched && stored instanceof pointedType) {
-				return stored as PointedModel<TContext, TModel>;
-			}
-
-			return this.fetchPointed(reference as ForeignReference<TModel>);
-		}
-
+	async fetch<TModel extends Entity<QueryProxy>>(reference: Partial<ForeignReference<TModel>>): Promise<TModel> {
 		if (reference.hasPrefetched) {
-			return stored as PointedModel<TContext, TModel>;
+			return (reference as unknown as { $stored: TModel }).$stored;
 		}
 
 		if (reference.id === null || reference.id === undefined) {
-			return null as PointedModel<TContext, TModel>;
+			return null as unknown as TModel;
 		}
 
-		return this.remember(await this.local.use(context => context.fetch(reference)), this.local) as PointedModel<TContext, TModel>;
+		const item = reference.$$item!;
+		const pointed = this.cohorts.pointedCohort(item.constructor, reference.$column);
+
+		if (pointed) {
+			// the database storing the item knows the pointer
+			return await this.references.loadPointed(pointed, reference.id, undefined, this.origins.get(item) ?? this.local) as TModel;
+		}
+
+		const cohort = this.cohorts.cohort(reference.$relation!);
+		let instance: DatabaseInstance<DatabaseContext> = this.local;
+
+		if (cohort) {
+			instance = this.origins.get(item) ?? (cohort.root == reference.$relation ? await this.requireCohortInstance(cohort, reference.id) : await this.itemInstance(item));
+		}
+
+		return this.remember(await instance.use(context => context.fetch(reference)), instance);
 	}
 
 	/**
-	 * Query of all entities referencing the item, in the databases named by its terminal method (`related(chat.messages).toArrayLocal()`)
+	 * Query of the entities referencing the item (`related(chat.messages).toArray()`)
+	 *
+	 * entities of the cohort of the item are read from the database the cohort is stored in
+	 * entities referencing the pointer of the item, or which are not part of its cohort, are read from the local database
 	 *
 	 * @param reference primary reference of the item (`chat.messages`)
 	 */
-	related<TModel extends ExposedModel<TContext> & Entity<TQueryProxy>, TQueryProxy extends QueryProxy>(reference: PrimaryReference<TModel, TQueryProxy>): ScopedQueryable<TModel, TQueryProxy> {
-		this.requireExposed(reference.$relation);
+	related<TModel extends ExposedModel<TContext> & Entity<TQueryProxy>, TQueryProxy extends QueryProxy>(reference: PrimaryReference<TModel, TQueryProxy>): LocalQueryable<TModel, TQueryProxy> {
+		const type = reference.$relation;
 
-		return new RoutedQuery<TModel, TQueryProxy>(reference.$relation, scope => this.scopeInstances(scope), context => context.related(reference), this.queryHooks(reference.$relation));
-	}
+		this.requireExposed(type);
 
-	/**
-	 * Databases a query with the scope reads, the local database first
-	 */
-	private scopeInstances(scope: QueryScope): DatabaseInstance<TContext>[] {
-		const remotes = [...this.remotes.values()];
+		const item = reference.$$item;
+		const cohort = this.cohorts.cohort(type);
+		const withinCohort = !this.cohorts.pointedCohort(type, reference.$column) && cohort && cohort == this.cohorts.cohort(item.constructor);
 
-		switch (scope) {
-			case 'local': return [this.local];
-			case 'remote': return remotes;
-			case 'all': return [this.local, ...remotes];
-		}
-
-		throw new Error(`Unknown query scope '${scope}'`);
-	}
-
-	private queryHooks(type: Function): RoutedQueryHooks<any> {
-		return {
-			prepareTree: tree => this.prepareTree(type, tree),
-			resolve: (items, tree, instance) => this.resolveIncludedPointers(items, tree, instance as DatabaseInstance<TContext>)
-		};
+		return new RoutedQuery<TModel, TQueryProxy>(type, async () => [{ instance: withinCohort ? await this.itemInstance(item) : this.local }], context => context.related(reference), this.queryHooks(type));
 	}
 
 	/**
 	 * Loads missing referenced data defined in the tree
 	 *
-	 * references to pointers load the entity they point to from the targeted database, the subtree applies to that entity
-	 * other references load from the database the item has been loaded from
+	 * references to pointers load the entity they point to from the database the pointer targets, the subtree applies to that entity
+	 * other references load from the database the item is stored in, like related entities referencing pointers of the item load from the local database
 	 *
 	 * @param pointerId id of the top level entity of the cohort, only required for items not loaded through this database which are not top level entities
 	 */
@@ -456,147 +424,49 @@ export class Database<TContext extends DatabaseContext> {
 		this.requireExposed(item.constructor);
 
 		const instance = await this.itemInstance(item, pointerId);
+		this.origins.set(item, instance);
 
-		const localTree: Record<string, any> = {};
-		const tasks: Promise<void>[] = [];
-
-		for (let property in tree) {
-			const reference = item[property as keyof typeof item];
-
-			if (reference instanceof ForeignReference && reference.$relation && this.pointedSetNames.has(reference.$relation)) {
-				const pointedType = this.set(this.schema, this.pointedSetNames.get(reference.$relation)!).modelConstructor;
-				const stored = reference as unknown as { $stored: unknown, $fetched: boolean };
-
-				// an included pointer is replaced by the entity it points to
-				if (!(stored.$stored instanceof pointedType)) {
-					tasks.push(this.fetchPointed(reference, tree[property]).then(pointed => {
-						stored.$stored = pointed;
-						stored.$fetched = true;
-					}));
-				}
-			} else {
-				if (reference instanceof ForeignReference || reference instanceof PrimaryReference) {
-					this.requireExposed(reference.$relation);
-
-					localTree[property] = typeof tree[property] == 'object' ? this.prepareTree(reference.$relation!, tree[property]) : tree[property];
-				} else {
-					localTree[property] = tree[property];
-				}
-			}
-		}
-
-		tasks.push(instance.use(context => context.backload(item, localTree)));
-
-		await Promise.all(tasks);
-		await this.resolveIncludedPointers([item], tree, instance);
+		await instance.use(context => context.backload(item, this.references.prepareTree(item.constructor, tree)));
+		await this.references.resolve([item], tree, instance);
 	}
 
 	/**
-	 * Replaces the subtrees of pointer references with the pointer columns, so vlquery includes the pointers
+	 * Databases a query of the top level table of the cohort reads
 	 *
-	 * the subtree is applied to the entity which replaces the pointer once loaded
+	 * the remote databases are the ones storing the cohorts the local database has pointers to, each limited to those cohorts
 	 */
-	private prepareTree(type: Function, tree: any) {
-		const model = new (type as new () => Entity<QueryProxy>)();
-		const prepared: Record<string, any> = {};
-
-		for (let property in tree) {
-			const reference = model[property as keyof typeof model];
-
-			if (reference instanceof ForeignReference && reference.$relation && this.pointedSetNames.has(reference.$relation)) {
-				prepared[property] = { id: true, target: true };
-			} else if ((reference instanceof ForeignReference || reference instanceof PrimaryReference) && reference.$relation && typeof tree[property] == 'object') {
-				prepared[property] = this.prepareTree(reference.$relation, tree[property]);
-			} else {
-				prepared[property] = tree[property];
-			}
+	private async rootTargets(cohort: Cohort, scope: QueryScope): Promise<QueryTarget[]> {
+		switch (scope) {
+			case 'local': return [{ instance: this.local }];
+			case 'remote': return this.pointers.remoteTargets(cohort);
+			case 'all': return [{ instance: this.local }, ...await this.pointers.remoteTargets(cohort)];
 		}
 
-		return prepared;
+		throw new Error(`Unknown query scope '${scope}'`);
 	}
 
-	/**
-	 * Replaces included pointers with the entities they point to, loaded from the databases the pointers target
-	 *
-	 * the subtree of a pointer reference in the tree is included in the entity replacing it
-	 * every entity reached is remembered with the database it has been loaded from
-	 *
-	 * @param instance database the items have been loaded from, the included pointers are followed from there
-	 */
-	private async resolveIncludedPointers(items: unknown[], tree: any, instance: DatabaseInstance<TContext>) {
-		const loads = new Map<string, Promise<[unknown, DatabaseInstance<TContext> | null]>>();
-		const visited = new Set<object>();
-
-		const visit = async (item: unknown, tree: any, origin: DatabaseInstance<TContext>): Promise<void> => {
-			if (!(item instanceof Entity) || visited.has(item)) {
-				return;
-			}
-
-			visited.add(item);
-
-			// entities loaded before, like the ones backload replaced pointers with, keep their database
-			origin = this.origins.get(item) ?? origin;
-			this.origins.set(item, origin);
-
-			const tasks: Promise<void>[] = [];
-
-			for (let key in item) {
-				const reference = item[key as keyof typeof item];
-				const stored = reference as unknown as { $stored: unknown };
-
-				// foreign references are stored in a '$' prefixed property
-				const subtree = typeof tree?.[key.replace(/^\$/, '')] == 'object' ? tree[key.replace(/^\$/, '')] : undefined;
-
-				if (reference instanceof ForeignReference) {
-					const pointedSetName = reference.$relation && this.pointedSetNames.get(reference.$relation);
-
-					if (pointedSetName && stored.$stored instanceof reference.$relation!) {
-						const pointer = stored.$stored as Entity<QueryProxy> & { target: string };
-						const load = `${origin.tag}:${pointedSetName}:${pointer.id}:${JSON.stringify(subtree ?? {})}`;
-
-						if (!loads.has(load)) {
-							loads.set(load, this.followPointer(this.setNames.get(reference.$relation!)!, pointer.id, pointer.target, origin).then(async instance => [
-								instance && await instance.use(context => this.queryPointed(context, pointedSetName, pointer.id, subtree)),
-								instance
-							]));
-						}
-
-						tasks.push(loads.get(load)!.then(([pointed, instance]) => {
-							stored.$stored = pointed;
-
-							// pointers included in the pointed entity have been loaded from its database
-							return instance ? visit(pointed, subtree, instance) : undefined;
-						}));
-					} else {
-						tasks.push(visit(stored.$stored, subtree, origin));
-					}
-				} else if (reference instanceof PrimaryReference) {
-					for (let child of (stored.$stored as unknown[] | undefined) ?? []) {
-						tasks.push(visit(child, subtree, origin));
-					}
-				}
-			}
-
-			await Promise.all(tasks);
+	private queryHooks(type: Function): RoutedQueryHooks<any> {
+		return {
+			prepareTree: tree => this.references.prepareTree(type, tree),
+			resolve: (items, tree, instance) => this.references.resolve(items, tree, instance)
 		};
-
-		await Promise.all(items.map(item => visit(item, tree, instance)));
 	}
 
 	private async find(type: Function, pointerId: string | number, id: string | number) {
-		const instance = await this.cohortInstance(type, pointerId);
+		const cohort = this.cohorts.cohort(type);
+		const instance = cohort ? await this.pointers.locate(cohort, pointerId) : this.local;
 
 		if (!instance) {
 			return null;
 		}
 
-		return this.remember(await instance.use(context => this.set(context, this.setNames.get(type)!).find(id)), instance);
+		return this.remember(await instance.use(context => this.set(context, type).find(id)), instance);
 	}
 
 	/**
 	 * Remembers the database the entity is stored in
 	 */
-	private remember<TItem>(item: TItem, instance: DatabaseInstance<TContext>) {
+	private remember<TItem>(item: TItem, instance: DatabaseInstance<DatabaseContext>) {
 		if (item instanceof Entity) {
 			this.origins.set(item, instance);
 		}
@@ -613,13 +483,14 @@ export class Database<TContext extends DatabaseContext> {
 	 */
 	private async itemInstance(item: Entity<QueryProxy>, pointerId?: string | number) {
 		const type = item.constructor;
+		const cohort = this.cohorts.cohort(type);
 
-		if (!this.cohortPointerSetNames.get(type)?.length) {
+		if (!cohort) {
 			return this.local;
 		}
 
 		if (pointerId !== undefined) {
-			return this.requireCohortInstance(type, pointerId);
+			return this.requireCohortInstance(cohort, pointerId);
 		}
 
 		const origin = this.origins.get(item);
@@ -628,275 +499,21 @@ export class Database<TContext extends DatabaseContext> {
 			return origin;
 		}
 
-		if (this.pointerSetNames.has(type)) {
-			return this.requireCohortInstance(type, item.id);
+		if (cohort.root == type) {
+			return this.requireCohortInstance(cohort, item.id);
 		}
 
 		throw new Error(`'${type.name}' '${item.id}' has not been loaded through database '${this.tag}', the pointer id of its cohort is required`);
 	}
 
-	/**
-	 * Loads the entity a pointer reference points to from the database the pointer targets
-	 */
-	private async fetchPointed(reference: ForeignReference<Entity<QueryProxy>>, tree?: any) {
-		const id = reference.id;
-
-		if (id === null || id === undefined) {
-			return null;
-		}
-
-		const pointedSetName = this.pointedSetNames.get(reference.$relation!)!;
-		const instance = await this.pointerInstance(this.setNames.get(reference.$relation!)!, id);
+	private async requireCohortInstance(cohort: Cohort, pointerId: string | number) {
+		const instance = await this.pointers.locate(cohort, pointerId);
 
 		if (!instance) {
-			return null;
-		}
-
-		const pointed = await instance.use(context => this.queryPointed(context, pointedSetName, id, tree));
-		await this.resolveIncludedPointers([pointed], tree, instance);
-
-		return pointed;
-	}
-
-	private queryPointed(context: DatabaseContext, pointedSetName: string, id: string | number, tree?: any) {
-		const set = this.set(context, pointedSetName);
-		let query = set.toQuery();
-
-		// vlquery finds nothing with an empty tree
-		if (tree && Object.keys(tree).length) {
-			query = query.includeTree(this.prepareTree(set.modelConstructor, tree));
-		}
-
-		return query.first(byId(id));
-	}
-
-	/**
-	 * Database the pointer of the cohort of the type targets, the local database if the type is not part of a cohort
-	 */
-	private async cohortInstance(type: Function, pointerId: string | number) {
-		const pointerSetNames = this.cohortPointerSetNames.get(type) ?? [];
-
-		if (!pointerSetNames.length) {
-			return this.local;
-		}
-
-		for (let pointerSetName of pointerSetNames) {
-			const instance = await this.pointerInstance(pointerSetName, pointerId);
-
-			if (instance) {
-				return instance;
-			}
-		}
-
-		return null;
-	}
-
-	private async requireCohortInstance(type: Function, pointerId: string | number) {
-		const instance = await this.cohortInstance(type, pointerId);
-
-		if (!instance) {
-			throw new Error(`No pointer '${pointerId}' found for '${type.name}' in database '${this.tag}'`);
+			throw new Error(`No pointer '${pointerId}' found for '${cohort.root.name}' in database '${this.tag}'`);
 		}
 
 		return instance;
-	}
-
-	/**
-	 * Database the pointer leads to, pointers are looked up in the local database
-	 */
-	private async pointerInstance(pointerSetName: string, pointerId: string | number) {
-		const pointer: { target: string } = await this.local.use(context => this.set(context, pointerSetName).find(pointerId));
-
-		return pointer ? this.followPointer(pointerSetName, pointerId, pointer.target, this.local) : null;
-	}
-
-	/**
-	 * Database the cohort is stored in, the pointer is followed through the pointers of the databases it targets until one targets itself
-	 *
-	 * a move only updates the pointers of the databases it involves, so other databases may still target the database the cohort left (EU → US → AP)
-	 * when the path is longer than one, the pointer in the origin database is updated to target the database the cohort is stored in (EU → AP)
-	 *
-	 * a deleted cohort takes its pointer along, when the path ends in a database without the pointer, the pointer in the origin database is deleted as well
-	 *
-	 * @param target target of the pointer in the origin database
-	 * @param origin database the pointer has been read from
-	 * @returns null if the cohort has been deleted
-	 */
-	private async followPointer(pointerSetName: string, pointerId: string | number, target: string, origin: DatabaseInstance<TContext>) {
-		const path = [origin.tag];
-		let instance = origin;
-
-		while (target != instance.tag) {
-			if (path.includes(target)) {
-				throw new Error(`Pointer '${pointerId}' in '${pointerSetName}' runs in a circle (${[...path, target].join(' → ')})`);
-			}
-
-			path.push(target);
-			instance = this.instance(target);
-
-			const pointer: { target: string } | null = await instance.use(context => this.set(context, pointerSetName).find(pointerId));
-
-			if (!pointer) {
-				await origin.use(context => this.deletePointer(context, pointerSetName, pointerId));
-
-				return null;
-			}
-
-			target = pointer.target;
-		}
-
-		if (path.length > 2) {
-			await origin.use(context => this.setPointer(context, pointerSetName, pointerId, instance.tag));
-		}
-
-		return instance;
-	}
-
-	/**
-	 * Tables of the cohort of the top level type, every table after the tables referencing it (children first)
-	 *
-	 * the children of a table are the tables referencing it, except for pointers and top level tables
-	 */
-	private cohortTables(type: Function) {
-		const tables = new Map<Function, CohortTable>();
-		const ordered: CohortTable[] = [];
-
-		const visit = (type: Function) => {
-			if (tables.has(type)) {
-				return tables.get(type)!;
-			}
-
-			const model = new (type as new () => Entity<QueryProxy>)();
-			const table: CohortTable = { source: model.$$meta.source, children: [], pointerColumns: [] };
-
-			tables.set(type, table);
-
-			for (let key in model) {
-				const reference = model[key as keyof typeof model];
-
-				if (reference instanceof PrimaryReference && !this.isPointer(reference.$relation) && !this.pointerSetNames.has(reference.$relation)) {
-					const child = visit(reference.$relation);
-
-					table.children.push({ table: child, column: new reference.$relation().$$meta.columns[reference.$column].name });
-				} else if (reference instanceof ForeignReference && reference.$relation && this.isPointer(reference.$relation)) {
-					table.pointerColumns.push({ source: new reference.$relation().$$meta.source, column: model.$$meta.columns[reference.$column!].name });
-				}
-			}
-
-			ordered.push(table);
-
-			return table;
-		};
-
-		visit(type);
-
-		return ordered;
-	}
-
-	/**
-	 * Rows of the cohort, by their id, read as json so they can be inserted into another database as they are
-	 *
-	 * starts at the top level row and follows the references of the children until no new rows are found
-	 */
-	private async collectCohort(context: DatabaseContext, tables: CohortTable[], pointerId: string | number) {
-		const cohort = new Map<CohortTable, Map<string, string>>(tables.map(table => [table, new Map()]));
-		const root = tables[tables.length - 1];
-
-		const add = (table: CohortTable, rows: [string, string][]) => {
-			const stored = cohort.get(table)!;
-			const added: string[] = [];
-
-			for (let [id, row] of rows) {
-				if (!stored.has(id)) {
-					stored.set(id, row);
-					added.push(row);
-				}
-			}
-
-			return added;
-		};
-
-		const queue: [CohortTable, string[]][] = [[root, add(root, await context.$$query(`SELECT t.id::text, row_to_json(t)::text FROM ${identifier(root.source)} t WHERE t.id = $1`, [pointerId]))]];
-
-		while (queue.length) {
-			const [parent, rows] = queue.shift()!;
-
-			for (let child of parent.children) {
-				const added = add(child.table, await context.$$query(`SELECT t.id::text, row_to_json(t)::text FROM ${identifier(child.table.source)} t WHERE t.${identifier(child.column)} IN (SELECT id FROM json_populate_recordset(NULL::${identifier(parent.source)}, $1::json))`, [jsonArray(rows)]));
-
-				if (added.length) {
-					queue.push([child.table, added]);
-				}
-			}
-		}
-
-		return cohort;
-	}
-
-	/**
-	 * Rows of the pointers referenced by the cohort, by the table of the pointer
-	 */
-	private async collectReferencedPointers(context: DatabaseContext, tables: CohortTable[], cohort: Map<CohortTable, Map<string, string>>) {
-		const pointers = new Map<string, Set<string>>();
-
-		for (let table of tables) {
-			const rows = cohort.get(table)!;
-
-			if (rows.size) {
-				for (let { source, column } of table.pointerColumns) {
-					const found: [string][] = await context.$$query(`SELECT row_to_json(p)::text FROM ${identifier(source)} p WHERE p.id IN (SELECT ${identifier(column)} FROM json_populate_recordset(NULL::${identifier(table.source)}, $1::json))`, [jsonArray(rows.values())]);
-
-					if (!pointers.has(source)) {
-						pointers.set(source, new Set());
-					}
-
-					for (let [row] of found) {
-						pointers.get(source)!.add(row);
-					}
-				}
-			}
-		}
-
-		return pointers;
-	}
-
-	/**
-	 * Deletes the rows of the cohort, children first, pointers are kept
-	 */
-	private async deleteCohort(context: DatabaseContext, tables: CohortTable[], cohort: Map<CohortTable, Map<string, string>>) {
-		for (let table of tables) {
-			const rows = cohort.get(table)!;
-
-			if (rows.size) {
-				await context.$$query(`DELETE FROM ${identifier(table.source)} WHERE id IN (SELECT id FROM json_populate_recordset(NULL::${identifier(table.source)}, $1::json))`, [jsonArray(rows.values())]);
-			}
-		}
-	}
-
-	/**
-	 * Points the pointer to the database with the tag, creates the pointer if it does not exist yet when requested
-	 */
-	private async setPointer(context: DatabaseContext, pointerSetName: string, pointerId: string | number, target: string, create = false) {
-		const meta = this.pointerMeta(pointerSetName);
-		const column = identifier(meta.columns.target.name);
-
-		if (create) {
-			await context.$$query(`INSERT INTO ${identifier(meta.source)} (id, ${column}) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET ${column} = EXCLUDED.${column}`, [pointerId, target]);
-		} else {
-			await context.$$query(`UPDATE ${identifier(meta.source)} SET ${column} = $2 WHERE id = $1`, [pointerId, target]);
-		}
-	}
-
-	/**
-	 * Inserts a new pointer targeting the local database, returns the id generated for it
-	 *
-	 * pointers are written without audits, they are internal and audits may require a comment
-	 */
-	private async insertPointer(context: DatabaseContext, pointerSetName: string): Promise<string | number> {
-		const meta = this.pointerMeta(pointerSetName);
-		const [[id]] = await context.$$query(`INSERT INTO ${identifier(meta.source)} (${identifier(meta.columns.target.name)}) VALUES ($1) RETURNING id`, [this.tag]);
-
-		return id;
 	}
 
 	/**
@@ -904,14 +521,14 @@ export class Database<TContext extends DatabaseContext> {
 	 *
 	 * a chat between an eu and a us account is created in eu, the us database gets a pointer to it as well
 	 */
-	private async createReferencingPointers(item: Entity<QueryProxy>, pointerSetName: string) {
-		const instances = new Set<DatabaseInstance<TContext>>();
+	private async createReferencingPointers(item: Entity<QueryProxy>, cohort: Cohort) {
+		const instances = new Set<DatabaseInstance<DatabaseContext>>();
 
-		for (let key in item) {
-			const reference = item[key as keyof typeof item];
+		for (let [column, referenced] of this.cohorts.pointerColumns(item.constructor)) {
+			const id = item[column as keyof typeof item] as string | number | null;
 
-			if (reference instanceof ForeignReference && reference.$relation && this.isPointer(reference.$relation) && reference.id !== null && reference.id !== undefined) {
-				const instance = await this.pointerInstance(this.setNames.get(reference.$relation)!, reference.id);
+			if (id !== null && id !== undefined) {
+				const instance = await this.pointers.locate(referenced, id);
 
 				// a deleted cohort has no database to inform
 				if (instance && instance != this.local) {
@@ -920,23 +537,7 @@ export class Database<TContext extends DatabaseContext> {
 			}
 		}
 
-		await Promise.all([...instances].map(instance => instance.use(context => this.setPointer(context, pointerSetName, item.id, this.tag, true))));
-	}
-
-	/**
-	 * Deletes the pointer, unless it is still referenced
-	 */
-	private async deletePointer(context: DatabaseContext, pointerSetName: string, pointerId: string | number) {
-		const meta = this.pointerMeta(pointerSetName);
-
-		try {
-			await context.$$query(`DELETE FROM ${identifier(meta.source)} WHERE id = $1`, [pointerId]);
-		} catch (error) {
-			// rows of other cohorts referencing the pointer keep it alive
-			if ((error as { code?: string }).code != foreignKeyViolation) {
-				throw error;
-			}
-		}
+		await Promise.all([...instances].map(instance => instance.use(context => this.pointers.set(context, cohort, item.id, this.tag, true))));
 	}
 
 	private instance(tag: string) {
@@ -953,12 +554,8 @@ export class Database<TContext extends DatabaseContext> {
 		return remote;
 	}
 
-	private pointerMeta(pointerSetName: string) {
-		return new (this.set(this.schema, pointerSetName).modelConstructor)().$$meta as Entity<QueryProxy>['$$meta'];
-	}
-
-	private set(context: DatabaseContext, name: string) {
-		return context[name as keyof DatabaseContext] as unknown as DbSet<any, any>;
+	private set(context: DatabaseContext, type: Function) {
+		return context[this.cohorts.setNames.get(type) as keyof DatabaseContext] as unknown as DbSet<any, any>;
 	}
 
 	/**
@@ -967,7 +564,7 @@ export class Database<TContext extends DatabaseContext> {
 	private exposeSet(find: Function, set: () => RoutedQuery<any, any> | ViewSet<any, any>, methods: readonly string[]) {
 		const exposed: Record<string, Function> = { find };
 
-		for (let method of methods) {
+		for (let method of ['toQuery', ...chainMethods, ...methods]) {
 			if (method != 'find') {
 				exposed[method] = (...args: any[]) => {
 					const target = set();
@@ -980,13 +577,9 @@ export class Database<TContext extends DatabaseContext> {
 		return Object.freeze(exposed);
 	}
 
-	private isPointer(type: Function) {
-		return isPointer(type);
-	}
-
 	private requireExposed(type: Function | undefined) {
-		if (type && this.isPointer(type)) {
-			throw new Error(`'${type.name}' is not exposed by database '${this.tag}'`);
+		if (type && !this.cohorts.setNames.has(type)) {
+			throw new Error(`'${type.name}' is not part of the context of database '${this.tag}'`);
 		}
 	}
 }
@@ -995,11 +588,6 @@ export class Database<TContext extends DatabaseContext> {
  * Splits the arguments of an operation taking an optional pointer id before the item
  */
 const splitItemArguments = <TModel>(args: [TModel, string?] | [string | number, TModel, string?]) => (args[0] instanceof Entity ? [undefined, args[0], args[1]] : args) as [string | number | undefined, TModel, string?];
-
-/**
- * Compiled query matching the id, the same vlquery uses for find
- */
-const byId = (id: string | number) => ({ compare: { left: { path: ['id'] }, right: { value: id }, operator: '=' } }) as any;
 
 /**
  * Creates the item with the given id, vlquery always lets the database generate it
@@ -1028,22 +616,3 @@ const createWithId = <TModel extends Entity<QueryProxy>>(context: DatabaseContex
 
 	return shadow.create(item, comment);
 };
-
-/**
- * Table of a cohort, with the tables referencing it and its references to pointers
- */
-type CohortTable = {
-	source: string;
-	children: { table: CohortTable, column: string }[];
-	pointerColumns: { source: string, column: string }[];
-};
-
-/**
- * Quoted identifier, the same vlquery uses for table names
- */
-const identifier = (name: string) => JSON.stringify(name);
-
-/**
- * Json array of rows already serialized by the database, so their values never pass through javascript numbers
- */
-const jsonArray = (rows: Iterable<string>) => `[${[...rows].join(',')}]`;

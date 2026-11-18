@@ -25,3 +25,4 @@ export {
 	View,
 	ViewSet
 } from 'vlquery';
+export { RootSet, MemberSet, CohortStructure } from './structure';

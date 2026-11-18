@@ -1,188 +1,130 @@
-import { DatabaseContext, DbSet, Entity, ForeignReference, QueryProxy } from 'vlquery';
+import { DatabaseContext, DbSet, Entity, QueryProxy } from 'vlquery';
+import { CohortStructure } from '../structure';
 
 /**
- * Suffix of entity classes that are kept internal
+ * Cohort of the schema, read from the structure generated into the context
  */
-export const pointerSuffix = '_Pointer';
+export type Cohort = {
+	root: Function;
+
+	/**
+	 * Name of the pointer table
+	 */
+	pointer: string;
+
+	/**
+	 * Type of the id shared by the root and its pointer
+	 */
+	idType: string;
+
+	/**
+	 * Tables of the cohort, every table after the tables referencing it (children first)
+	 */
+	tables: CohortTable[];
+};
 
 /**
- * Database structure which can not be parsed into cohorts
+ * Table of a cohort, with the tables of the cohort referencing it and its columns referencing pointers
  */
-export class CohortStructureError extends Error {
-	constructor(readonly problems: string[]) {
-		super(`Invalid cohort structure:\n${problems.map(problem => `- ${problem}`).join('\n')}`);
+export type CohortTable = {
+	type: Function;
+	source: string;
+	children: { table: CohortTable, column: string }[];
+	pointerColumns: { pointer: string, column: string }[];
+};
+
+/**
+ * Cohort structure of a generated context, indexed by type
+ */
+export class Cohorts {
+	/**
+	 * Name of the set of each type
+	 */
+	readonly setNames = new Map<Function, string>();
+
+	private readonly cohorts = new Map<Function, Cohort>();
+
+	/**
+	 * Cohort each pointer reference leads to, by type and property of the referencing column
+	 */
+	private readonly pointerReferences = new Map<Function, Map<string, Cohort>>();
+
+	constructor(schema: DatabaseContext, structure: CohortStructure | undefined) {
+		if (!structure) {
+			throw new Error(`Context '${schema.constructor.name}' has no cohort structure, create it with 'acryps-local create-context'`);
+		}
+
+		for (let name in schema) {
+			const set = schema[name as keyof DatabaseContext];
+
+			if (set instanceof DbSet) {
+				this.setNames.set(set.modelConstructor, name);
+			}
+		}
+
+		const roots = new Map<Function, Cohort>();
+
+		for (let description of structure.cohorts) {
+			const cohort: Cohort = { root: description.root, pointer: description.pointer, idType: meta(description.root).columns.id.type, tables: [] };
+			const tables = new Map<Function, CohortTable>();
+
+			for (let type of [description.root, ...description.members.map(member => member.type)]) {
+				tables.set(type, { type, source: meta(type).source, children: [], pointerColumns: [] });
+				this.cohorts.set(type, cohort);
+			}
+
+			for (let member of description.members) {
+				for (let parent of member.parents) {
+					tables.get(parent.type)!.children.push({ table: tables.get(member.type)!, column: meta(member.type).columns[parent.column].name });
+				}
+			}
+
+			// members are described after their parents
+			cohort.tables = [...tables.values()].reverse();
+			roots.set(description.root, cohort);
+		}
+
+		for (let reference of structure.pointerReferences) {
+			const cohort = roots.get(reference.root)!;
+
+			if (!this.pointerReferences.has(reference.type)) {
+				this.pointerReferences.set(reference.type, new Map());
+			}
+
+			this.pointerReferences.get(reference.type)!.set(reference.column, cohort);
+			this.cohorts.get(reference.type)?.tables.find(table => table.type == reference.type)!.pointerColumns.push({ pointer: cohort.pointer, column: meta(reference.type).columns[reference.column].name });
+		}
+	}
+
+	/**
+	 * Cohort the type belongs to, as root or member
+	 */
+	cohort(type: Function) {
+		return this.cohorts.get(type);
+	}
+
+	/**
+	 * Cohort of which the type is the root
+	 */
+	rootCohort(type: Function) {
+		const cohort = this.cohorts.get(type);
+
+		return cohort?.root == type ? cohort : undefined;
+	}
+
+	/**
+	 * Cohort the column of the type leads to through its pointer, undefined if the column does not reference a pointer
+	 */
+	pointedCohort(type: Function | undefined, column: string | undefined) {
+		return type && column ? this.pointerReferences.get(type)?.get(column) : undefined;
+	}
+
+	/**
+	 * Columns of the type referencing pointers, by their property
+	 */
+	pointerColumns(type: Function) {
+		return [...this.pointerReferences.get(type) ?? []];
 	}
 }
 
-/**
- * Sets of the schema parsed into cohorts
- */
-export type Cohorts = {
-	setNames: Map<Function, string>;
-
-	/**
-	 * Top level type to the name of its pointer set
-	 */
-	pointerSetNames: Map<Function, string>;
-
-	/**
-	 * Pointer type to the name of the set it points to
-	 */
-	pointedSetNames: Map<Function, string>;
-
-	/**
-	 * Type to the names of the pointer sets of the cohorts it belongs to, at most one
-	 */
-	cohortPointerSetNames: Map<Function, string[]>;
-};
-
-export const isPointer = (type: Function) => type.name.endsWith(pointerSuffix);
-
-/**
- * Parses the sets of the schema into cohorts
- *
- * the structure is validated along, every problem found is collected before throwing a CohortStructureError
- * - a pointer table points to a table, has a target column, shares the id type of the table it points to and references no other tables
- * - a table belongs to one cohort at most, as its rows are stored in one database
- * - a table of a cohort has an id of type uuid, as its rows are created in and moved between databases
- * - a top level table references the tables of other cohorts through their pointer tables
- */
-export const parseCohorts = (schema: DatabaseContext): Cohorts => {
-	const problems: string[] = [];
-
-	const cohorts: Cohorts = {
-		setNames: new Map(),
-		pointerSetNames: new Map(),
-		pointedSetNames: new Map(),
-		cohortPointerSetNames: new Map()
-	};
-
-	for (let name in schema) {
-		const set = schema[name as keyof DatabaseContext];
-
-		if (set instanceof DbSet) {
-			cohorts.setNames.set(set.modelConstructor, name);
-		}
-	}
-
-	for (let [type, name] of cohorts.setNames) {
-		if (isPointer(type)) {
-			const pointer = createModel(type);
-			const pointedName = name.substring(0, name.length - pointerSuffix.length);
-			const pointedSet = schema[pointedName as keyof DatabaseContext];
-
-			if (!(pointedSet instanceof DbSet)) {
-				problems.push(`Pointer table '${pointer.$$meta.source}' does not point to a table, no table '${pointer.$$meta.source.replace(/__pointer$/, '')}' found`);
-
-				continue;
-			}
-
-			const pointed = createModel(pointedSet.modelConstructor);
-
-			if (!pointer.$$meta.columns.target) {
-				problems.push(`Pointer table '${pointer.$$meta.source}' has no column 'target'`);
-			}
-
-			if (pointer.$$meta.columns.id?.type != pointed.$$meta.columns.id?.type) {
-				problems.push(`Pointer table '${pointer.$$meta.source}' has an id of type '${pointer.$$meta.columns.id?.type}', but '${pointed.$$meta.source}' has an id of type '${pointed.$$meta.columns.id?.type}'`);
-			}
-
-			for (let [column, relation] of foreignReferences(pointer)) {
-				problems.push(`Pointer table '${pointer.$$meta.source}' references '${createModel(relation).$$meta.source}' (column '${column}'), pointer tables are stored in every database and can not reference other tables`);
-			}
-
-			cohorts.pointerSetNames.set(pointedSet.modelConstructor, name);
-			cohorts.pointedSetNames.set(type, pointedName);
-		}
-	}
-
-	for (let type of cohorts.setNames.keys()) {
-		if (!isPointer(type)) {
-			cohorts.cohortPointerSetNames.set(type, findCohortPointerSetNames(cohorts, type, new Set()));
-		}
-	}
-
-	// cohorts are named after their top level table
-	const cohortSource = (pointerSetName: string) => createModel([...cohorts.pointerSetNames].find(([, name]) => name == pointerSetName)![0]).$$meta.source;
-
-	for (let [type, pointerSetNames] of cohorts.cohortPointerSetNames) {
-		const model = createModel(type);
-
-		// ids are generated in every database and rows are moved between them, sequences would collide
-		if (pointerSetNames.length && model.$$meta.columns.id?.type != 'uuid') {
-			problems.push(`Table '${model.$$meta.source}' belongs to the cohort of '${cohortSource(pointerSetNames[0])}' but has an id of type '${model.$$meta.columns.id?.type}', cohort tables require ids of type 'uuid' to be unique across all databases`);
-		}
-
-		if (pointerSetNames.length > 1) {
-			problems.push(`Table '${model.$$meta.source}' belongs to multiple cohorts (${pointerSetNames.map(name => `'${cohortSource(name)}'`).join(', ')}), its rows can only be stored in one database. Reference all but one of them through their pointer tables`);
-		}
-
-		const pointerSetName = cohorts.pointerSetNames.get(type);
-
-		// tables below the top level table join the cohorts they reference, which is covered above
-		if (pointerSetName) {
-			for (let [column, relation] of foreignReferences(model)) {
-				const referenced = isPointer(relation) ? [] : cohorts.cohortPointerSetNames.get(relation) ?? [];
-
-				if (referenced.length && !referenced.includes(pointerSetName)) {
-					problems.push(`Top level table '${model.$$meta.source}' references '${createModel(relation).$$meta.source}' of the cohort of '${cohortSource(referenced[0])}' directly (column '${column}'), its rows can be stored in another database. Reference '${cohortSource(referenced[0])}' through its pointer table instead`);
-				}
-			}
-		}
-	}
-
-	if (problems.length) {
-		throw new CohortStructureError(problems);
-	}
-
-	return cohorts;
-};
-
-/**
- * Pointer sets of the top level types the type references, directly or through other entities
- */
-const findCohortPointerSetNames = (cohorts: Cohorts, type: Function, visited: Set<Function>): string[] => {
-	const pointerSetName = cohorts.pointerSetNames.get(type);
-
-	if (pointerSetName) {
-		return [pointerSetName];
-	}
-
-	if (visited.has(type)) {
-		return [];
-	}
-
-	visited.add(type);
-
-	const names = new Set<string>();
-
-	// a reference to a pointer leads into another cohort
-	for (let [, relation] of foreignReferences(createModel(type))) {
-		if (!isPointer(relation)) {
-			for (let name of findCohortPointerSetNames(cohorts, relation, visited)) {
-				names.add(name);
-			}
-		}
-	}
-
-	return [...names];
-};
-
-/**
- * Foreign references of the model, by the name of their column
- */
-const foreignReferences = (model: Entity<QueryProxy>) => {
-	const references: [string, Function][] = [];
-
-	for (let key in model) {
-		const reference = model[key as keyof typeof model];
-
-		if (reference instanceof ForeignReference && reference.$relation) {
-			references.push([model.$$meta.columns[reference.$column!]?.name ?? reference.$column, reference.$relation]);
-		}
-	}
-
-	return references;
-};
-
-const createModel = (type: Function) => new (type as new () => Entity<QueryProxy>)();
+export const meta = (type: Function) => new (type as new () => Entity<QueryProxy>)().$$meta;
