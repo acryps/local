@@ -1,8 +1,10 @@
-import { DatabaseContext, DbClient, DbSet, Entity, ForeignReference, PrimaryReference, QueryProxy, Queryable, ViewSet } from 'vlquery';
+import { DatabaseContext, DbClient, DbSet, Entity, ForeignReference, PrimaryReference, QueryProxy, ViewSet } from 'vlquery';
 import { DatabaseConfiguration } from '../types/database-configuration';
 import { isPointer, parseCohorts, pointerSuffix } from './cohorts';
 import { DatabaseInstance } from './instance';
-import { RoutedQuery, RoutedQueryHooks } from './routed-query';
+import { QueryScope, RoutedQuery, RoutedQueryHooks, ScopedQueryable, scopedQueryMethods } from './routed-query';
+
+export { QueryScope, ScopedQueryable } from './routed-query';
 
 /**
  * Milliseconds a remote connection stays open after its last use
@@ -15,16 +17,12 @@ const defaultRemoteIdleTimeout = 60 * 1000;
 const foreignKeyViolation = '23503';
 
 /**
- * Methods exposed on a set, everything else (like the context) stays hidden
+ * Methods exposed on sets and views, everything else (like the context) stays hidden
  */
-const setMethods = [
+const queryMethods = [
 	'find',
 	'toQuery',
 	'where',
-	'first',
-	'single',
-	'toArray',
-	'count',
 	'include',
 	'includeTree',
 	'orderByAscending',
@@ -33,6 +31,16 @@ const setMethods = [
 	'limit',
 	'page'
 ] as const;
+
+/**
+ * Methods exposed on a view, views only read the local database
+ */
+const viewMethods = [...queryMethods, 'first', 'single', 'toArray', 'count'] as const;
+
+/**
+ * Methods exposed on a set, its terminal methods name the databases they read (`toArrayLocal`, `toArrayRemote`, `toArrayAll`)
+ */
+const setMethods = [...queryMethods, ...scopedQueryMethods];
 
 /**
  * Names of the sets which are not pointers
@@ -44,9 +52,11 @@ export type ExposedSetName<TContext> = {
 }[keyof TContext] & string;
 
 /**
- * Set reduced to its public methods, find is located by the pointer of the cohort
+ * Set reduced to its public methods, terminal methods name the databases they read, find is located by the pointer of the cohort
  */
-export type ExposedSet<TSet> = Omit<ExposedView<TSet>, 'find'> & {
+export type ExposedSet<TSet> = (TSet extends DbSet<infer TModel, infer TQueryProxy> ? ScopedQueryable<TModel, TQueryProxy> & {
+	toQuery(): ScopedQueryable<TModel, TQueryProxy>;
+} : never) & {
 	/**
 	 * Loads the entity from the database the pointer of its cohort targets
 	 *
@@ -59,7 +69,7 @@ export type ExposedSet<TSet> = Omit<ExposedView<TSet>, 'find'> & {
 /**
  * View reduced to its public methods
  */
-export type ExposedView<TSet> = Pick<TSet, typeof setMethods[number] & keyof TSet>;
+export type ExposedView<TSet> = Pick<TSet, typeof viewMethods[number] & keyof TSet>;
 
 export type ExposedSets<TContext> = { readonly [Name in ExposedSetName<TContext>]: ExposedSet<TContext[Name]> };
 export type ExposedViews<TContext> = TContext extends { views: infer TViews } ? { readonly [Name in keyof TViews]: ExposedView<TViews[Name]> } : {};
@@ -89,7 +99,7 @@ export type PointedModel<TContext, TModel> = [TModel] extends [ModelOf<TContext[
  * the top level table of a cohort has a pointer table, which names the database (by its tag) the cohort is stored in
  * the other tables of the cohort reference the top level table, so their rows are stored in the same database
  *
- * queries only read the local database
+ * queries read the local database, the remote databases or all of them, as named by their terminal method (`toArrayLocal`, `toArrayRemote`, `toArrayAll`)
  * entities are loaded from remote databases by following a pointer, either a reference to a pointer or the pointer id passed to find, update and delete
  */
 export class Database<TContext extends DatabaseContext> {
@@ -157,10 +167,10 @@ export class Database<TContext extends DatabaseContext> {
 
 		for (let [type, name] of this.setNames) {
 			if (!this.isPointer(type)) {
-				// queries only read the local database
 				sets[name] = this.exposeSet(
 					(pointerId: string | number, id = pointerId) => this.find(type, pointerId, id),
-					() => new RoutedQuery(async () => this.local, context => this.set(context, name).toQuery(), this.queryHooks(type))
+					() => new RoutedQuery(type, scope => this.scopeInstances(scope), context => this.set(context, name).toQuery(), this.queryHooks(type)),
+					setMethods
 				);
 			}
 		}
@@ -173,7 +183,7 @@ export class Database<TContext extends DatabaseContext> {
 		for (let name in schemaViews) {
 			const view = () => (this.local.context as unknown as { views: Record<string, ViewSet<any, any>> }).views[name];
 
-			views[name] = this.exposeSet((id: string | number) => view().find(id), view);
+			views[name] = this.exposeSet((id: string | number) => view().find(id), view, viewMethods);
 		}
 
 		this.views = Object.freeze(views) as ExposedViews<TContext>;
@@ -374,8 +384,7 @@ export class Database<TContext extends DatabaseContext> {
 	/**
 	 * Loads the referenced entity
 	 *
-	 * a reference to a pointer loads the entity it points to from the targeted database
-	 * a reference within a cohort loads from the database the referencing item has been loaded from, other references load from the local database
+	 * a reference to a pointer loads the entity it points to from the targeted database, other references load from the local database
 	 */
 	async fetch<TModel extends Entity<QueryProxy>>(reference: Partial<ForeignReference<TModel>>): Promise<PointedModel<TContext, TModel>> {
 		const stored = (reference as unknown as { $stored: unknown }).$stored;
@@ -399,21 +408,33 @@ export class Database<TContext extends DatabaseContext> {
 			return null as PointedModel<TContext, TModel>;
 		}
 
-		const instance = await this.referenceInstance(reference as ForeignReference<TModel>);
-
-		return this.remember(await instance.use(context => context.fetch(reference)), instance) as PointedModel<TContext, TModel>;
+		return this.remember(await this.local.use(context => context.fetch(reference)), this.local) as PointedModel<TContext, TModel>;
 	}
 
 	/**
-	 * Query of all entities referencing the item, in the database the item has been loaded from
+	 * Query of all entities referencing the item, in the databases named by its terminal method (`related(chat.messages).toArrayLocal()`)
 	 *
 	 * @param reference primary reference of the item (`chat.messages`)
-	 * @param pointerId id of the top level entity of the cohort (`related(message.pictures, chatId)`), only required for items not loaded through this database which are not top level entities
 	 */
-	related<TModel extends ExposedModel<TContext> & Entity<TQueryProxy>, TQueryProxy extends QueryProxy>(reference: PrimaryReference<TModel, TQueryProxy>, pointerId?: string | number): Queryable<TModel, TQueryProxy> {
+	related<TModel extends ExposedModel<TContext> & Entity<TQueryProxy>, TQueryProxy extends QueryProxy>(reference: PrimaryReference<TModel, TQueryProxy>): ScopedQueryable<TModel, TQueryProxy> {
 		this.requireExposed(reference.$relation);
 
-		return new RoutedQuery<TModel, TQueryProxy>(() => this.itemInstance(reference.$$item, pointerId), context => context.related(reference), this.queryHooks(reference.$relation));
+		return new RoutedQuery<TModel, TQueryProxy>(reference.$relation, scope => this.scopeInstances(scope), context => context.related(reference), this.queryHooks(reference.$relation));
+	}
+
+	/**
+	 * Databases a query with the scope reads, the local database first
+	 */
+	private scopeInstances(scope: QueryScope): DatabaseInstance<TContext>[] {
+		const remotes = [...this.remotes.values()];
+
+		switch (scope) {
+			case 'local': return [this.local];
+			case 'remote': return remotes;
+			case 'all': return [this.local, ...remotes];
+		}
+
+		throw new Error(`Unknown query scope '${scope}'`);
 	}
 
 	private queryHooks(type: Function): RoutedQueryHooks<any> {
@@ -612,28 +633,6 @@ export class Database<TContext extends DatabaseContext> {
 		}
 
 		throw new Error(`'${type.name}' '${item.id}' has not been loaded through database '${this.tag}', the pointer id of its cohort is required`);
-	}
-
-	/**
-	 * Database the referenced entity is stored in, references within a cohort lead into the database of the referencing item
-	 */
-	private async referenceInstance(reference: ForeignReference<Entity<QueryProxy>>) {
-		if (!this.cohortPointerSetNames.get(reference.$relation!)?.length) {
-			return this.local;
-		}
-
-		const origin = this.origins.get(reference.$$item);
-
-		if (origin) {
-			return origin;
-		}
-
-		// a reference to the top level entity of the cohort carries the pointer id
-		if (this.pointerSetNames.has(reference.$relation!)) {
-			return this.requireCohortInstance(reference.$relation!, reference.id);
-		}
-
-		return this.itemInstance(reference.$$item);
 	}
 
 	/**
@@ -965,15 +964,15 @@ export class Database<TContext extends DatabaseContext> {
 	/**
 	 * Exposes the set methods, bound instead of exposing the set itself, so the context can not be reached through it
 	 */
-	private exposeSet(find: Function, set: () => RoutedQuery<any, any> | ViewSet<any, any>) {
+	private exposeSet(find: Function, set: () => RoutedQuery<any, any> | ViewSet<any, any>, methods: readonly string[]) {
 		const exposed: Record<string, Function> = { find };
 
-		for (let method of setMethods) {
+		for (let method of methods) {
 			if (method != 'find') {
 				exposed[method] = (...args: any[]) => {
 					const target = set();
 
-					return (target[method] as Function).apply(target, args);
+					return (target[method as keyof typeof target] as Function).apply(target, args);
 				};
 			}
 		}
